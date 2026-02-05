@@ -2,17 +2,16 @@
  * Permission Gate Extension
  *
  * Prompts for confirmation before running potentially dangerous bash commands.
- * 
- * Patterns checked:
- * - rm -rf
- * - sudo
- * - chmod/chown 777
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	const dangerousPatterns = [/\brm\s+(-rf?|--recursive)/i, /\bsudo\b/i, /\b(chmod|chown)\b.*777/i];
+	const dangerousPatterns = [
+		/\brm\s+(-rf?|--recursive)/i, // recursive delete
+		/\bsudo\b/i,                   // elevated privileges
+		/\b(chmod|chown)\b.*777/i,     // world-writable permissions
+	];
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;

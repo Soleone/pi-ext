@@ -6,3 +6,4 @@ Personal extensions for the [pi coding agent](https://github.com/badlogic/pi-mon
 
 - `input-stash`: `Ctrl+X` to stash/restore editor input. Stash when input has text, restore when blank.
 - `permission-gate`: Prompts for confirmation before running dangerous bash commands.
+- `venice-provider`: Venice.ai dynamic model fetching with basic caching.

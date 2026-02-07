@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
 import { DynamicBorder } from "@mariozechner/pi-coding-agent"
-import { Container, SelectList, Text, matchesKey, Key, truncateToWidth, type SelectItem, CURSOR_MARKER } from "@mariozechner/pi-tui"
+import { Container, SelectList, Text, matchesKey, Key, truncateToWidth, CURSOR_MARKER } from "@mariozechner/pi-tui"
 
 type IssueStatus = "open" | "in_progress" | "blocked" | "deferred" | "closed"
 
@@ -20,18 +20,6 @@ interface BdIssue {
   dependent_count?: number
   comment_count?: number
 }
-
-// Result from list/edit views — either a navigation action or a priority change
-type ViewResult =
-  | { action: "select"; id: string }
-  | { action: "priority"; id: string; priority: number }
-  | { action: "cancel" }
-
-// Internal actions for the issue list component (extends ViewResult with filter control)
-type ListAction =
-  | ViewResult
-  | { action: "applyFilter"; term: string }
-  | { action: "clearFilter" }
 
 interface IssueListConfig {
   title: string
@@ -190,12 +178,12 @@ export default function beadsTasks(pi: ExtensionAPI) {
   }
 
   // Issue list with description preview and priority hotkeys.
-  async function showIssueList(ctx: ExtensionCommandContext, config: IssueListConfig): Promise<ViewResult> {
+  async function showIssueList(ctx: ExtensionCommandContext, config: IssueListConfig): Promise<void> {
     const { title, issues, allowPriority = true, allowSearch = true } = config
 
     if (issues.length === 0) {
       ctx.ui.notify("No issues found", "info")
-      return { action: "cancel" }
+      return
     }
 
     // Mutable copy for local updates
@@ -217,6 +205,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         stripAnsi(`${formatPriority(i.priority)} ${(i.issue_type || "issue").slice(0, 4).toUpperCase()} ${stripIdPrefix(i.id)} ${i.title}`).length
       ))
 
+      let selectedId: string | undefined
       const result = await ctx.ui.custom<"cancel" | "select">((tui: any, theme: any, _kb: any, done: any) => {
         const container = new Container()
         let searching = false
@@ -252,7 +241,11 @@ export default function beadsTasks(pi: ExtensionAPI) {
           updateDescPreview()
           tui.requestRender()
         }
-        selectList.onSelect = () => done("select")
+        selectList.onSelect = () => {
+          const sel = selectList.getSelectedItem()
+          if (sel) selectedId = sel.value
+          done("select")
+        }
         selectList.onCancel = () => {
           if (filterTerm) {
             filterTerm = ""
@@ -369,7 +362,11 @@ export default function beadsTasks(pi: ExtensionAPI) {
             updateDescPreview()
             tui.requestRender()
           }
-          selectList.onSelect = () => done("select")
+          selectList.onSelect = () => {
+            const sel = selectList.getSelectedItem()
+            if (sel) selectedId = sel.value
+            done("select")
+          }
           selectList.onCancel = () => {
             if (filterTerm) {
               filterTerm = ""
@@ -524,26 +521,13 @@ export default function beadsTasks(pi: ExtensionAPI) {
         }
       })
 
-      if (result === "cancel") return { action: "cancel" }
-      if (result === "select") {
-        // Find selected issue
-        const filtered = filterTerm
-          ? displayIssues.filter(i => matchesFilter(i, filterTerm))
-          : displayIssues
-        const items = filtered.map((issue) => ({
-          value: issue.id,
-          label: formatIssueLabel(issue, maxLabelWidth),
-          description: formatIssueDescription(issue),
-        }))
-        const selectedId = items[0]?.value
-
-        if (selectedId) {
-          const updated = await editIssue(ctx, selectedId)
-          if (updated) {
-            const idx = displayIssues.findIndex(i => i.id === selectedId)
-            if (idx !== -1) {
-              displayIssues[idx] = updated
-            }
+      if (result === "cancel") return
+      if (result === "select" && selectedId) {
+        const updated = await editIssue(ctx, selectedId)
+        if (updated) {
+          const idx = displayIssues.findIndex(i => i.id === selectedId)
+          if (idx !== -1) {
+            displayIssues[idx] = updated
           }
         }
         continue
@@ -761,30 +745,25 @@ export default function beadsTasks(pi: ExtensionAPI) {
 
       if (!result) return null
 
-      let changed = false
       if (titleValue.trim() !== issue.title.trim()) {
         await updateIssue(id, ["--title", titleValue.trim()])
         ctx.ui.notify("Title updated", "success")
         issue.title = titleValue.trim()
-        changed = true
       }
       if (descValue !== (issue.description ?? "")) {
         await updateIssue(id, ["--description", descValue])
         ctx.ui.notify("Description updated", "success")
         issue.description = descValue
-        changed = true
       }
       if (statusValue !== issue.status) {
         await updateIssue(id, ["--status", statusValue])
         ctx.ui.notify(`Status: ${statusValue}`, "success")
         issue.status = statusValue
-        changed = true
       }
       if (priorityValue !== issue.priority) {
         await updateIssue(id, ["--priority", String(priorityValue)])
         ctx.ui.notify(`Priority: P${priorityValue}`, "success")
         issue.priority = priorityValue
-        changed = true
       }
 
       return issue
@@ -794,41 +773,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
   async function browseIssues(ctx: ExtensionCommandContext, mode: ListMode): Promise<void> {
     const modeTitle = mode === "ready" ? "Beads — Ready" : mode === "open" ? "Beads — Open" : "Beads — All"
 
-    while (true) {
-      try {
-        ctx.ui.setStatus("beads", "Loading…")
-        let issues = await listIssues(mode)
-        ctx.ui.setStatus("beads", undefined)
-
-        while (true) {
-          const result = await showIssueList(ctx, { title: modeTitle, issues })
-
-          if (result.action === "cancel") return
-
-          if (result.action === "priority") {
-            await updateIssue(result.id, ["--priority", String(result.priority)])
-            issues = issues.map(i =>
-              i.id === result.id ? { ...i, priority: result.priority } : i
-            )
-            ctx.ui.notify(`Priority set to P${result.priority}`, "success")
-            continue
-          }
-
-          if (result.action === "select") {
-            const updated = await editIssue(ctx, result.id)
-            if (updated) {
-              issues = issues.map(i =>
-                i.id === result.id ? updated : i
-              )
-            }
-            continue
-          }
-        }
-      } catch (e) {
-        ctx.ui.setStatus("beads", undefined)
-        ctx.ui.notify(e instanceof Error ? e.message : String(e), "error")
-        return
-      }
+    try {
+      ctx.ui.setStatus("beads", "Loading…")
+      const issues = await listIssues(mode)
+      ctx.ui.setStatus("beads", undefined)
+      await showIssueList(ctx, { title: modeTitle, issues })
+    } catch (e) {
+      ctx.ui.setStatus("beads", undefined)
+      ctx.ui.notify(e instanceof Error ? e.message : String(e), "error")
     }
   }
 

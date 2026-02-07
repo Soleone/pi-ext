@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
 import { DynamicBorder } from "@mariozechner/pi-coding-agent"
-import { Container, SelectList, Text, matchesKey, Key, truncateToWidth, CURSOR_MARKER } from "@mariozechner/pi-tui"
+import { Container, SelectList, Spacer, Text, matchesKey, Key, truncateToWidth, CURSOR_MARKER } from "@mariozechner/pi-tui"
 import {
   DESCRIPTION_PART_SEPARATOR,
   EDIT_HELP_TEXT,
@@ -118,6 +118,16 @@ export default function beadsTasks(pi: ExtensionAPI) {
     const issue = issues[0]
     if (!issue) throw new Error(`Issue not found: ${id}`)
     return issue
+  }
+
+  function needsIssueDetailsForEdit(issue: BdIssue): boolean {
+    return issue.description === undefined
+  }
+
+  async function getIssueForEdit(id: string, fromList?: BdIssue): Promise<BdIssue> {
+    if (!fromList) return showIssue(id)
+    if (needsIssueDetailsForEdit(fromList)) return showIssue(id)
+    return { ...fromList }
   }
 
   async function updateIssue(id: string, args: string[]): Promise<void> {
@@ -295,7 +305,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         }
 
         const descTextComponent = new Text(buildDescText([], 80), 0, 0)
-        container.addChild(new Text("", 1, 0)) // Empty line
+        container.addChild(new Spacer(1))
         container.addChild(descTextComponent)
 
         let lastWidth = 80
@@ -405,7 +415,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
           container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
           container.addChild(titleText)
           container.addChild(selectList)
-          container.addChild(new Text("", 1, 0)) // Empty line
+          container.addChild(new Spacer(1))
           container.addChild(descTextComponent)
           container.addChild(new DynamicBorder((s: string) => theme.fg("muted", s)))
           container.addChild(helpText)
@@ -552,7 +562,8 @@ export default function beadsTasks(pi: ExtensionAPI) {
       if (result === "cancel") return
       if (result === "select" && selectedId) {
         rememberedSelectedId = selectedId
-        const updated = await editIssue(ctx, selectedId)
+        const currentIssue = displayIssues.find(i => i.id === selectedId)
+        const updated = await editIssue(ctx, selectedId, currentIssue)
         if (updated) {
           const idx = displayIssues.findIndex(i => i.id === selectedId)
           if (idx !== -1) {
@@ -565,8 +576,8 @@ export default function beadsTasks(pi: ExtensionAPI) {
   }
 
   // Issue form editor with inline editable fields
-  async function editIssue(ctx: ExtensionCommandContext, id: string): Promise<BdIssue | null> {
-    let issue = await showIssue(id)
+  async function editIssue(ctx: ExtensionCommandContext, id: string, fromList?: BdIssue): Promise<BdIssue | null> {
+    let issue = await getIssueForEdit(id, fromList)
 
     while (true) {
       let titleValue = issue.title

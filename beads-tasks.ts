@@ -1,25 +1,21 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
 import { DynamicBorder } from "@mariozechner/pi-coding-agent"
 import { Container, SelectList, Text, matchesKey, Key, truncateToWidth, CURSOR_MARKER } from "@mariozechner/pi-tui"
-
-type IssueStatus = "open" | "in_progress" | "blocked" | "deferred" | "closed"
+import {
+  DESCRIPTION_PART_SEPARATOR,
+  EDIT_HELP_TEXT,
+  buildIssueEditHeader,
+  buildIssueListRowModel,
+  buildWorkPrompt,
+  decodeIssueDescription,
+  stripAnsi,
+  type BdIssue,
+  type EditFocus,
+  type IssueStatus,
+} from "./beads-task-view-model.ts"
+import { resolveListIntent } from "./beads-list-controller.ts"
 
 type ListMode = "ready" | "open" | "all"
-
-interface BdIssue {
-  id: string
-  title: string
-  description?: string
-  status: IssueStatus
-  priority?: number
-  issue_type?: string
-  owner?: string
-  created_at?: string
-  updated_at?: string
-  dependency_count?: number
-  dependent_count?: number
-  comment_count?: number
-}
 
 interface IssueListConfig {
   title: string
@@ -37,61 +33,12 @@ function isLikelyIssueId(value: string): boolean {
   return /^[a-z0-9]+-[a-z0-9]+$/i.test(value)
 }
 
-// ANSI 256-color codes for priority
-const PRIORITY_COLORS: Record<number, string> = {
-  0: "\x1b[38;5;196m", // red
-  1: "\x1b[38;5;208m", // orange
-  2: "\x1b[38;5;34m",  // green
-  3: "\x1b[38;5;33m",  // blue
-  4: "\x1b[38;5;245m", // gray
-}
-
-function formatPriority(priority: number | undefined): string {
-  if (priority === undefined || priority === null) return "P?"
-  const color = PRIORITY_COLORS[priority] ?? ""
-  return `${color}P${priority}\x1b[0m`
-}
-
-function stripIdPrefix(id: string): string {
-  const idx = id.indexOf("-")
-  return idx >= 0 ? id.slice(idx + 1) : id
-}
-
-function firstLine(text: string | undefined): string | undefined {
-  if (!text) return undefined
-  const line = text.split(/\r?\n/)[0]?.trim()
-  return line && line.length > 0 ? line : undefined
-}
-
 function truncateDescription(desc: string | undefined, maxLines: number): string[] {
   if (!desc || !desc.trim()) return ["(no description)"]
   const allLines = desc.split(/\r?\n/)
   const lines = allLines.slice(0, maxLines)
   if (allLines.length > maxLines) lines.push("...")
   return lines
-}
-
-function stripAnsi(str: string): string {
-  return str.replace(/\x1b\[[0-9;]*m/g, "")
-}
-
-function formatIssueLabel(issue: BdIssue, maxLabelWidth?: number): string {
-  const label = `${formatPriority(issue.priority)} ${stripIdPrefix(issue.id)} ${issue.title}`
-  if (maxLabelWidth !== undefined) {
-    const visibleWidth = stripAnsi(label).length
-    if (visibleWidth < maxLabelWidth) {
-      return label + " ".repeat(maxLabelWidth - visibleWidth)
-    }
-  }
-  return label
-}
-
-function formatIssueDescription(issue: BdIssue): string {
-  const extra = firstLine(issue.description)
-  const type = (issue.issue_type || "issue").slice(0, 4).padEnd(4)
-  const status = issue.status.slice(0, 4).padEnd(4)
-  if (extra) return `${status} • ${type} • ${extra}`
-  return `${status} • ${type}`
 }
 
 function parseJsonArray<T>(stdout: string, context: string): T[] {
@@ -127,7 +74,7 @@ function isPrintable(data: string): boolean {
 
 function listHelpText(opts: { searching: boolean; filtered: boolean; allowPriority: boolean; allowSearch: boolean }): string {
   if (opts.searching) return "type to search • enter apply • esc cancel"
-  const parts = ["↑↓ navigate", "enter select"]
+  const parts = ["↑↓/w/s navigate", "enter work", "e edit"]
   if (opts.allowPriority) parts.push("0-4 priority")
   if (opts.allowSearch) parts.push("ctrl+f search")
   parts.push(opts.filtered ? "esc clear filter" : "esc cancel")
@@ -189,6 +136,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
     // Mutable copy for local updates
     const displayIssues = [...issues]
     let filterTerm = config.filterTerm || ""
+    let rememberedSelectedId: string | undefined
 
     while (true) {
       const visible = filterTerm
@@ -202,7 +150,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
       }
 
       const maxLabelWidth = Math.max(...displayIssues.map(i =>
-        stripAnsi(`${formatPriority(i.priority)} ${(i.issue_type || "issue").slice(0, 4).toUpperCase()} ${stripIdPrefix(i.id)} ${i.title}`).length
+        stripAnsi(buildIssueListRowModel(i).label).length
       ))
 
       let selectedId: string | undefined
@@ -217,33 +165,63 @@ export default function beadsTasks(pi: ExtensionAPI) {
         const titleText = new Text("", 1, 0)
         container.addChild(titleText)
 
+        const accentMarker = "__ACCENT_MARKER__"
+        const accentedMarker = theme.fg("accent", accentMarker)
+        const markerIndex = accentedMarker.indexOf(accentMarker)
+        const accentPrefix = markerIndex >= 0 ? accentedMarker.slice(0, markerIndex) : ""
+        const accentSuffix = markerIndex >= 0 ? accentedMarker.slice(markerIndex + accentMarker.length) : "\x1b[0m"
+        const applyAccentWithAnsi = (text: string) => {
+          const normalized = text.replaceAll(DESCRIPTION_PART_SEPARATOR, " • ")
+          if (!accentPrefix) return theme.fg("accent", normalized)
+          return `${accentPrefix}${normalized.replace(/\x1b\[0m/g, `\x1b[0m${accentPrefix}`)}${accentSuffix}`
+        }
+
+        const styleDescription = (text: string) => {
+          const { meta, summary } = decodeIssueDescription(text)
+          if (!summary) return theme.fg("muted", meta)
+          return `${theme.fg("muted", meta)} • ${summary}`
+        }
+
         const getItems = () => {
           const filtered = filterTerm
             ? displayIssues.filter(i => matchesFilter(i, filterTerm))
             : displayIssues
-          return filtered.map((issue) => ({
-            value: issue.id,
-            label: formatIssueLabel(issue, maxLabelWidth),
-            description: formatIssueDescription(issue),
-          }))
+          return filtered.map((issue) => {
+            const row = buildIssueListRowModel(issue, maxLabelWidth)
+            return {
+              value: row.id,
+              label: row.label,
+              description: row.description,
+            }
+          })
         }
 
         let items = getItems()
         let selectList = new SelectList(items, Math.min(items.length, 10), {
           selectedPrefix: (t: string) => theme.fg("accent", t),
-          selectedText: (t: string) => theme.fg("accent", t),
-          description: (t: string) => theme.fg("muted", t),
+          selectedText: (t: string) => applyAccentWithAnsi(t),
+          description: (t: string) => styleDescription(t),
           scrollInfo: (t: string) => theme.fg("dim", t),
           noMatch: (t: string) => theme.fg("warning", t),
         })
 
+        if (rememberedSelectedId) {
+          const rememberedIndex = items.findIndex(i => i.value === rememberedSelectedId)
+          if (rememberedIndex >= 0) selectList.setSelectedIndex(rememberedIndex)
+        }
+
         selectList.onSelectionChange = () => {
+          const selected = selectList.getSelectedItem()
+          if (selected) rememberedSelectedId = selected.value
           updateDescPreview()
           tui.requestRender()
         }
         selectList.onSelect = () => {
           const sel = selectList.getSelectedItem()
-          if (sel) selectedId = sel.value
+          if (sel) {
+            selectedId = sel.value
+            rememberedSelectedId = sel.value
+          }
           done("select")
         }
         selectList.onCancel = () => {
@@ -340,7 +318,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         const helpText = new Text("", 1, 0)
         container.addChild(helpText)
 
-        const shortcutsText = new Text(theme.fg("dim", "0-4 priority • space status • j/k scroll"), 1, 0)
+        const shortcutsText = new Text(theme.fg("dim", "enter work • e edit • w/s nav • 0-4 priority • space status • j/k scroll"), 1, 0)
         container.addChild(shortcutsText)
 
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
@@ -362,6 +340,25 @@ export default function beadsTasks(pi: ExtensionAPI) {
         }
         refreshDisplay()
 
+        const moveSelection = (delta: number) => {
+          if (items.length === 0) return
+          const selected = selectList.getSelectedItem()
+          const currentIndex = selected ? items.findIndex(i => i.value === selected.value) : 0
+          const normalizedIndex = currentIndex >= 0 ? currentIndex : 0
+          const nextIndex = (normalizedIndex + delta + items.length) % items.length
+          selectList.setSelectedIndex(nextIndex)
+          updateDescPreview()
+          container.invalidate()
+          tui.requestRender()
+        }
+
+        const getSelectedIssue = (): BdIssue | undefined => {
+          const selected = selectList.getSelectedItem()
+          if (!selected) return undefined
+          rememberedSelectedId = selected.value
+          return displayIssues.find(i => i.id === selected.value)
+        }
+
         // Re-render helper - rebuild entire container to maintain component order
         const rebuildAndRender = () => {
           items = getItems()
@@ -375,19 +372,24 @@ export default function beadsTasks(pi: ExtensionAPI) {
           // Recreate SelectList
           selectList = new SelectList(items, Math.min(items.length, 10), {
             selectedPrefix: (t: string) => theme.fg("accent", t),
-            selectedText: (t: string) => theme.fg("accent", t),
-            description: (t: string) => theme.fg("muted", t),
+            selectedText: (t: string) => applyAccentWithAnsi(t),
+            description: (t: string) => styleDescription(t),
             scrollInfo: (t: string) => theme.fg("dim", t),
             noMatch: (t: string) => theme.fg("warning", t),
           })
 
           selectList.onSelectionChange = () => {
+            const selected = selectList.getSelectedItem()
+            if (selected) rememberedSelectedId = selected.value
             updateDescPreview()
             tui.requestRender()
           }
           selectList.onSelect = () => {
             const sel = selectList.getSelectedItem()
-            if (sel) selectedId = sel.value
+            if (sel) {
+              selectedId = sel.value
+              rememberedSelectedId = sel.value
+            }
             done("select")
           }
           selectList.onCancel = () => {
@@ -429,123 +431,127 @@ export default function beadsTasks(pi: ExtensionAPI) {
           },
           invalidate: () => container.invalidate(),
           handleInput: (data: string) => {
-            // Ctrl+q or esc cancels
-            if (data === CTRL_Q || matchesKey(data, Key.escape)) {
-              done("cancel")
-              return
-            }
+            const intent = resolveListIntent(data, {
+              searching,
+              allowSearch,
+              allowPriority,
+              ctrlQ: CTRL_Q,
+              ctrlF: CTRL_F,
+            })
 
-            if (searching) {
-              if (matchesKey(data, Key.escape)) {
-                searching = false
+            switch (intent.type) {
+              case "cancel":
+                done("cancel")
+                return
+
+              case "searchStart":
+                searching = true
                 searchBuffer = ""
                 refreshDisplay()
                 container.invalidate()
                 tui.requestRender()
                 return
-              }
-              if (matchesKey(data, Key.enter)) {
+
+              case "searchApply":
                 filterTerm = searchBuffer.trim()
                 searching = false
                 rebuildAndRender()
                 refreshDisplay()
                 return
-              }
-              if (matchesKey(data, Key.backspace)) {
+
+              case "searchBackspace":
                 searchBuffer = searchBuffer.slice(0, -1)
                 refreshDisplay()
                 container.invalidate()
                 tui.requestRender()
                 return
-              }
-              if (isPrintable(data)) {
-                searchBuffer += data
+
+              case "searchAppend":
+                searchBuffer += intent.value
                 refreshDisplay()
                 container.invalidate()
                 tui.requestRender()
                 return
+
+              case "moveSelection":
+                moveSelection(intent.delta)
+                return
+
+              case "work": {
+                const issue = getSelectedIssue()
+                if (issue) {
+                  done("cancel")
+                  pi.sendUserMessage(buildWorkPrompt(issue))
+                }
+                return
               }
-              return
-            }
 
-            if (allowSearch && data === CTRL_F) {
-              searching = true
-              searchBuffer = ""
-              refreshDisplay()
-              container.invalidate()
-              tui.requestRender()
-              return
-            }
+              case "edit": {
+                const issue = getSelectedIssue()
+                if (issue) {
+                  selectedId = issue.id
+                  done("select")
+                }
+                return
+              }
 
-            // Toggle status with space
-            if (data === " ") {
-              const selected = selectList.getSelectedItem()
-              if (selected) {
-                const issue = displayIssues.find(i => i.id === selected.value)
+              case "toggleStatus": {
+                const issue = getSelectedIssue()
                 if (issue) {
                   const newStatus = cycleStatus(issue.status)
                   issue.status = newStatus
                   updateIssue(issue.id, ["--status", newStatus])
                   rebuildAndRender()
                 }
+                return
               }
-              return
-            }
 
-            if (allowPriority) {
-              const p = parsePriorityKey(data)
-              if (p !== null) {
-                const selected = selectList.getSelectedItem()
-                if (selected) {
-                  const issue = displayIssues.find(i => i.id === selected.value)
-                  if (issue && issue.priority !== p) {
-                    issue.priority = p
-                    updateIssue(issue.id, ["--priority", String(p)])
-                    rebuildAndRender()
-                  }
+              case "setPriority": {
+                const issue = getSelectedIssue()
+                if (issue && issue.priority !== intent.priority) {
+                  issue.priority = intent.priority
+                  updateIssue(issue.id, ["--priority", String(intent.priority)])
+                  rebuildAndRender()
                 }
                 return
               }
-            }
 
-            // Description scrolling with j/k
-            if (data === "j" || data === "k") {
-              const selected = selectList.getSelectedItem()
-              if (selected) {
-                const issue = displayIssues.find(i => i.id === selected.value)
+              case "scrollDescription": {
+                const issue = getSelectedIssue()
                 if (issue) {
                   const descLines = truncateDescription(issue.description, 100)
-                  // Calculate total wrapped lines
                   const allWrapped: string[] = []
                   for (const line of descLines) {
                     const wrapped = wrapText(line, lastWidth, 100)
                     allWrapped.push(...wrapped)
                   }
                   const maxScroll = Math.max(0, allWrapped.length - 7)
-                  if (data === "j" && descScroll < maxScroll) {
+                  if (intent.delta > 0 && descScroll < maxScroll) {
                     descScroll++
-                  } else if (data === "k" && descScroll > 0) {
+                  } else if (intent.delta < 0 && descScroll > 0) {
                     descScroll--
                   }
-                  // Show 7 lines starting from scroll position
                   const visible = allWrapped.slice(descScroll, descScroll + 7)
                   while (visible.length < 7) visible.push("")
                   descTextComponent.setText(visible.join("\n"))
                   container.invalidate()
                   tui.requestRender()
                 }
+                return
               }
-              return
-            }
 
-            selectList.handleInput(data)
-            tui.requestRender()
+              case "delegate":
+                selectList.handleInput(data)
+                tui.requestRender()
+                return
+            }
           },
         }
       })
 
       if (result === "cancel") return
       if (result === "select" && selectedId) {
+        rememberedSelectedId = selectedId
         const updated = await editIssue(ctx, selectedId)
         if (updated) {
           const idx = displayIssues.findIndex(i => i.id === selectedId)
@@ -567,7 +573,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
       let descValue = issue.description ?? ""
       let statusValue = issue.status
       let priorityValue = issue.priority
-      let focused: "nav" | "title" | "desc" = "nav"
+      let focused: EditFocus = "nav"
       let titleCursor = issue.title.length
       let descCursor = (issue.description ?? "").length
 
@@ -576,8 +582,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
           render: (w: number) => {
             const lines: string[] = []
             lines.push("─".repeat(Math.min(50, w)))
-            const shortId = stripIdPrefix(issue.id)
-            const headerText = `${formatPriority(priorityValue)} ${shortId} [${statusValue}]`
+            const headerText = buildIssueEditHeader(issue.id, priorityValue, statusValue)
             lines.push(truncateToWidth(headerText, w))
             lines.push("")
             lines.push(focused === "title" ? "▸ Title:" : "  Title:")
@@ -615,15 +620,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
               }
             }
             lines.push("")
-            let help: string
-            if (focused === "title") {
-              help = "type | backspace | enter save | tab desc | esc cancel"
-            } else if (focused === "desc") {
-              help = "type | backspace | arrows | enter save | tab nav | esc cancel"
-            } else {
-              help = "tab nav | space status | 1-5 priority | esc/ctrl+c back"
-            }
-            lines.push(truncateToWidth(help, w))
+            lines.push(truncateToWidth(EDIT_HELP_TEXT[focused], w))
             lines.push("─".repeat(Math.min(50, w)))
             return lines
           },
@@ -634,21 +631,8 @@ export default function beadsTasks(pi: ExtensionAPI) {
               tui.requestRender()
               return
             }
-            if (matchesKey(data, Key.escape)) {
-              if (focused !== "nav") {
-                if (focused === "title") {
-                  titleValue = issue.title
-                  titleCursor = issue.title.length
-                } else {
-                  descValue = issue.description ?? ""
-                  descCursor = (issue.description ?? "").length
-                }
-                focused = "nav"
-              } else {
-                done(false)
-                return
-              }
-              tui.requestRender()
+            if (matchesKey(data, Key.escape) || data === "q" || data === "Q") {
+              done(false)
               return
             }
             if (matchesKey(data, Key.ctrl("c"))) {

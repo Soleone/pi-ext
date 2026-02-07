@@ -13,7 +13,11 @@ import {
   type EditFocus,
   type IssueStatus,
 } from "./beads-task-view-model.ts"
-import { resolveListIntent } from "./beads-list-controller.ts"
+import {
+  buildListPrimaryHelpText,
+  buildListSecondaryHelpText,
+  resolveListIntent,
+} from "./beads-list-controller.ts"
 
 type ListMode = "ready" | "open" | "all"
 
@@ -70,15 +74,6 @@ function matchesFilter(issue: BdIssue, term: string): boolean {
 
 function isPrintable(data: string): boolean {
   return data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) < 127
-}
-
-function listHelpText(opts: { searching: boolean; filtered: boolean; allowPriority: boolean; allowSearch: boolean }): string {
-  if (opts.searching) return "type to search • enter apply • esc cancel"
-  const parts = ["↑↓/w/s navigate", "enter work", "e edit"]
-  if (opts.allowPriority) parts.push("0-4 priority")
-  if (opts.allowSearch) parts.push("ctrl+f search")
-  parts.push(opts.filtered ? "esc clear filter" : "esc cancel")
-  return parts.join(" • ")
 }
 
 const CYCLE_STATUSES: IssueStatus[] = ["open", "in_progress", "closed"]
@@ -328,7 +323,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         const helpText = new Text("", 1, 0)
         container.addChild(helpText)
 
-        const shortcutsText = new Text(theme.fg("dim", "enter work • e edit • w/s nav • 0-4 priority • space status • j/k scroll"), 1, 0)
+        const shortcutsText = new Text(theme.fg("dim", buildListSecondaryHelpText()), 1, 0)
         container.addChild(shortcutsText)
 
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
@@ -341,12 +336,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
           } else {
             titleText.setText(theme.fg("accent", theme.bold(title)))
           }
-          helpText.setText(theme.fg("dim", listHelpText({
+          helpText.setText(theme.fg("dim", buildListPrimaryHelpText({
             searching,
             filtered: !!filterTerm,
             allowPriority,
             allowSearch,
-          }) + " • j/k scroll"))
+            ctrlQ: CTRL_Q,
+            ctrlF: CTRL_F,
+          })))
         }
         refreshDisplay()
 
@@ -443,6 +440,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
           handleInput: (data: string) => {
             const intent = resolveListIntent(data, {
               searching,
+              filtered: !!filterTerm,
               allowSearch,
               allowPriority,
               ctrlQ: CTRL_Q,
@@ -456,6 +454,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
 
               case "searchStart":
                 searching = true
+                searchBuffer = ""
+                refreshDisplay()
+                container.invalidate()
+                tui.requestRender()
+                return
+
+              case "searchCancel":
+                searching = false
                 searchBuffer = ""
                 refreshDisplay()
                 container.invalidate()

@@ -3,6 +3,7 @@ import { Key, matchesKey } from "@mariozechner/pi-tui"
 export type ListIntent =
   | { type: "cancel" }
   | { type: "searchStart" }
+  | { type: "searchCancel" }
   | { type: "searchApply" }
   | { type: "searchBackspace" }
   | { type: "searchAppend"; value: string }
@@ -16,10 +17,21 @@ export type ListIntent =
 
 export interface ListControllerState {
   searching: boolean
+  filtered: boolean
   allowSearch: boolean
   allowPriority: boolean
   ctrlQ: string
   ctrlF: string
+}
+
+type ShortcutContext = "default" | "search"
+
+interface ShortcutDefinition {
+  context: ShortcutContext
+  help?: string
+  showInHelp?: (state: ListControllerState) => boolean
+  match: (data: string, state: ListControllerState) => boolean
+  intent: (data: string) => ListIntent
 }
 
 function parsePriorityKey(data: string): number | null {
@@ -32,38 +44,108 @@ function isPrintable(data: string): boolean {
   return data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) < 127
 }
 
+const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
+  {
+    context: "search",
+    match: (data, state) => data === state.ctrlQ,
+    intent: () => ({ type: "cancel" }),
+  },
+  {
+    context: "search",
+    help: "esc cancel",
+    match: (data) => matchesKey(data, Key.escape),
+    intent: () => ({ type: "searchCancel" }),
+  },
+  {
+    context: "search",
+    help: "enter apply",
+    match: (data) => matchesKey(data, Key.enter),
+    intent: () => ({ type: "searchApply" }),
+  },
+  {
+    context: "search",
+    match: (data) => matchesKey(data, Key.backspace),
+    intent: () => ({ type: "searchBackspace" }),
+  },
+  {
+    context: "search",
+    help: "type to search",
+    match: (data) => isPrintable(data),
+    intent: (data) => ({ type: "searchAppend", value: data }),
+  },
+  {
+    context: "default",
+    help: "↑↓/w/s navigate",
+    match: (data) => data === "w" || data === "W" || data === "s" || data === "S",
+    intent: (data) => ({ type: "moveSelection", delta: data === "w" || data === "W" ? -1 : 1 }),
+  },
+  {
+    context: "default",
+    help: "enter work",
+    match: (data) => matchesKey(data, Key.enter),
+    intent: () => ({ type: "work" }),
+  },
+  {
+    context: "default",
+    help: "e edit",
+    match: (data) => data === "e" || data === "E",
+    intent: () => ({ type: "edit" }),
+  },
+  {
+    context: "default",
+    help: "0-4 priority",
+    showInHelp: (state) => state.allowPriority,
+    match: (data, state) => state.allowPriority && parsePriorityKey(data) !== null,
+    intent: (data) => ({ type: "setPriority", priority: parsePriorityKey(data) ?? 0 }),
+  },
+  {
+    context: "default",
+    help: "ctrl+f search",
+    showInHelp: (state) => state.allowSearch,
+    match: (data, state) => state.allowSearch && data === state.ctrlF,
+    intent: () => ({ type: "searchStart" }),
+  },
+  {
+    context: "default",
+    match: (data) => data === " ",
+    intent: () => ({ type: "toggleStatus" }),
+  },
+  {
+    context: "default",
+    match: (data) => data === "j" || data === "k",
+    intent: (data) => ({ type: "scrollDescription", delta: data === "j" ? 1 : -1 }),
+  },
+  {
+    context: "default",
+    match: (data, state) => data === state.ctrlQ,
+    intent: () => ({ type: "cancel" }),
+  },
+]
+
 export function resolveListIntent(data: string, state: ListControllerState): ListIntent {
-  if (data === state.ctrlQ || matchesKey(data, Key.escape)) {
-    return { type: "cancel" }
+  const context: ShortcutContext = state.searching ? "search" : "default"
+  for (const shortcut of SHORTCUT_DEFINITIONS) {
+    if (shortcut.context !== context) continue
+    if (shortcut.match(data, state)) return shortcut.intent(data)
   }
-
-  if (state.searching) {
-    if (matchesKey(data, Key.enter)) return { type: "searchApply" }
-    if (matchesKey(data, Key.backspace)) return { type: "searchBackspace" }
-    if (isPrintable(data)) return { type: "searchAppend", value: data }
-    return { type: "delegate" }
-  }
-
-  if (state.allowSearch && data === state.ctrlF) {
-    return { type: "searchStart" }
-  }
-
-  if (data === "w" || data === "W") return { type: "moveSelection", delta: -1 }
-  if (data === "s" || data === "S") return { type: "moveSelection", delta: 1 }
-
-  if (matchesKey(data, Key.enter)) return { type: "work" }
-  if (data === "e" || data === "E") return { type: "edit" }
-
-  if (data === " ") return { type: "toggleStatus" }
-
-  if (state.allowPriority) {
-    const priority = parsePriorityKey(data)
-    if (priority !== null) return { type: "setPriority", priority }
-  }
-
-  if (data === "j" || data === "k") {
-    return { type: "scrollDescription", delta: data === "j" ? 1 : -1 }
-  }
-
   return { type: "delegate" }
+}
+
+export function buildListPrimaryHelpText(state: ListControllerState): string {
+  const context: ShortcutContext = state.searching ? "search" : "default"
+  const parts = SHORTCUT_DEFINITIONS
+    .filter(s => s.context === context)
+    .filter(s => !!s.help)
+    .filter(s => (s.showInHelp ? s.showInHelp(state) : true))
+    .map(s => s.help as string)
+
+  if (context === "default") {
+    parts.push(state.filtered ? "esc clear filter" : "esc cancel")
+  }
+
+  return parts.join(" • ")
+}
+
+export function buildListSecondaryHelpText(): string {
+  return "space status • j/k scroll"
 }

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
 import { DynamicBorder } from "@mariozechner/pi-coding-agent"
-import { Container, SelectList, Text, truncateToWidth, type SelectItem } from "@mariozechner/pi-tui"
+import { Container, SelectList, Text, matchesKey, Key, truncateToWidth, type SelectItem, CURSOR_MARKER } from "@mariozechner/pi-tui"
 
 type IssueStatus = "open" | "in_progress" | "blocked" | "deferred" | "closed"
 
@@ -38,11 +38,12 @@ interface IssueListConfig {
   issues: BdIssue[]
   allowPriority?: boolean
   allowSearch?: boolean
+  filterTerm?: string
 }
 
 const MAX_LIST_RESULTS = 200
-const HELP_EDIT = "↑↓ navigate • enter select • 0-4 priority • esc back"
 const CTRL_F = "\x06"
+const CTRL_Q = "\x11"
 
 function isLikelyIssueId(value: string): boolean {
   return /^[a-z0-9]+-[a-z0-9]+$/i.test(value)
@@ -56,12 +57,11 @@ const PRIORITY_COLORS: Record<number, string> = {
   3: "\x1b[38;5;33m",  // blue
   4: "\x1b[38;5;245m", // gray
 }
-const RESET = "\x1b[0m"
 
 function formatPriority(priority: number | undefined): string {
   if (priority === undefined || priority === null) return "P?"
   const color = PRIORITY_COLORS[priority] ?? ""
-  return `${color}P${priority}${RESET}`
+  return `${color}P${priority}\x1b[0m`
 }
 
 function stripIdPrefix(id: string): string {
@@ -83,15 +83,27 @@ function truncateDescription(desc: string | undefined, maxLines: number): string
   return lines
 }
 
-function formatIssueLabel(issue: BdIssue): string {
-  return `${formatPriority(issue.priority)} ${stripIdPrefix(issue.id)} ${issue.title}`
+function stripAnsi(str: string): string {
+  return str.replace(/\x1b\[[0-9;]*m/g, "")
+}
+
+function formatIssueLabel(issue: BdIssue, maxLabelWidth?: number): string {
+  const label = `${formatPriority(issue.priority)} ${stripIdPrefix(issue.id)} ${issue.title}`
+  if (maxLabelWidth !== undefined) {
+    const visibleWidth = stripAnsi(label).length
+    if (visibleWidth < maxLabelWidth) {
+      return label + " ".repeat(maxLabelWidth - visibleWidth)
+    }
+  }
+  return label
 }
 
 function formatIssueDescription(issue: BdIssue): string {
   const extra = firstLine(issue.description)
-  const type = issue.issue_type ? `${issue.issue_type}` : "issue"
-  if (extra) return `${issue.status} • ${type} • ${extra}`
-  return `${issue.status} • ${type}`
+  const type = (issue.issue_type || "issue").slice(0, 4).padEnd(4)
+  const status = issue.status.slice(0, 4).padEnd(4)
+  if (extra) return `${status} • ${type} • ${extra}`
+  return `${status} • ${type}`
 }
 
 function parseJsonArray<T>(stdout: string, context: string): T[] {
@@ -103,10 +115,6 @@ function parseJsonArray<T>(stdout: string, context: string): T[] {
     const msg = e instanceof Error ? e.message : String(e)
     throw new Error(`Failed to parse bd output (${context}): ${msg}`)
   }
-}
-
-function safeRender(container: Container, w: number): string[] {
-  return container.render(w).map((line) => truncateToWidth(line, w))
 }
 
 function parsePriorityKey(data: string): number | null {
@@ -136,6 +144,14 @@ function listHelpText(opts: { searching: boolean; filtered: boolean; allowPriori
   if (opts.allowSearch) parts.push("ctrl+f search")
   parts.push(opts.filtered ? "esc clear filter" : "esc cancel")
   return parts.join(" • ")
+}
+
+const CYCLE_STATUSES: IssueStatus[] = ["open", "in_progress", "closed"]
+
+function cycleStatus(current: IssueStatus): IssueStatus {
+  const idx = CYCLE_STATUSES.indexOf(current)
+  if (idx === -1) return "open"
+  return CYCLE_STATUSES[(idx + 1) % CYCLE_STATUSES.length]
 }
 
 export default function beadsTasks(pi: ExtensionAPI) {
@@ -173,8 +189,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
     await execBd(["update", id, ...args])
   }
 
-  // Reusable issue list with Ctrl+F search, priority hotkeys, and description preview.
-  // Manages filter state internally — callers get a clean ViewResult back.
+  // Issue list with description preview and priority hotkeys.
   async function showIssueList(ctx: ExtensionCommandContext, config: IssueListConfig): Promise<ViewResult> {
     const { title, issues, allowPriority = true, allowSearch = true } = config
 
@@ -183,12 +198,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
       return { action: "cancel" }
     }
 
-    let filterTerm = ""
+    // Mutable copy for local updates
+    const displayIssues = [...issues]
+    let filterTerm = config.filterTerm || ""
 
     while (true) {
       const visible = filterTerm
-        ? issues.filter((i) => matchesFilter(i, filterTerm))
-        : issues
+        ? displayIssues.filter(i => matchesFilter(i, filterTerm))
+        : displayIssues
 
       if (visible.length === 0) {
         ctx.ui.notify(`No matches for "${filterTerm}"`, "warning")
@@ -196,24 +213,34 @@ export default function beadsTasks(pi: ExtensionAPI) {
         continue
       }
 
-      const issueMap = new Map(visible.map((i) => [i.id, i]))
-      const items: SelectItem[] = visible.map((issue) => ({
-        value: issue.id,
-        label: formatIssueLabel(issue),
-        description: formatIssueDescription(issue),
-      }))
+      const maxLabelWidth = Math.max(...displayIssues.map(i =>
+        stripAnsi(`${formatPriority(i.priority)} ${(i.issue_type || "issue").slice(0, 4).toUpperCase()} ${stripIdPrefix(i.id)} ${i.title}`).length
+      ))
 
-      const result = await ctx.ui.custom<ListAction>((tui: any, theme: any, _kb: any, done: any) => {
+      const result = await ctx.ui.custom<"cancel" | "select">((tui: any, theme: any, _kb: any, done: any) => {
         const container = new Container()
         let searching = false
         let searchBuffer = ""
+        let descScroll = 0
 
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
 
         const titleText = new Text("", 1, 0)
         container.addChild(titleText)
 
-        const selectList = new SelectList(items, Math.min(items.length, 10), {
+        const getItems = () => {
+          const filtered = filterTerm
+            ? displayIssues.filter(i => matchesFilter(i, filterTerm))
+            : displayIssues
+          return filtered.map((issue) => ({
+            value: issue.id,
+            label: formatIssueLabel(issue, maxLabelWidth),
+            description: formatIssueDescription(issue),
+          }))
+        }
+
+        let items = getItems()
+        let selectList = new SelectList(items, Math.min(items.length, 10), {
           selectedPrefix: (t: string) => theme.fg("accent", t),
           selectedText: (t: string) => theme.fg("accent", t),
           description: (t: string) => theme.fg("muted", t),
@@ -221,37 +248,87 @@ export default function beadsTasks(pi: ExtensionAPI) {
           noMatch: (t: string) => theme.fg("warning", t),
         })
 
-        const descPreview = new Text("", 1, 0)
-        const updateDescPreview = (issueId: string) => {
-          const issue = issueMap.get(issueId)
-          const lines = truncateDescription(issue?.description, 5)
-          descPreview.setText(lines.map((l) => theme.fg("dim", l)).join("\n"))
-        }
-
-        if (items[0]) updateDescPreview(items[0].value)
-
-        selectList.onSelectionChange = (item: SelectItem) => {
-          updateDescPreview(item.value)
+        selectList.onSelectionChange = () => {
+          updateDescPreview()
           tui.requestRender()
         }
-        selectList.onSelect = (item: SelectItem) => done({ action: "select", id: item.value })
+        selectList.onSelect = () => done("select")
         selectList.onCancel = () => {
           if (filterTerm) {
-            done({ action: "clearFilter" })
+            filterTerm = ""
+            items = getItems()
+            selectList = new SelectList(items, Math.min(items.length, 10), selectList.theme)
+            selectList.onSelectionChange = selectList.onSelectionChange
+            selectList.onSelect = selectList.onSelect
+            selectList.onCancel = selectList.onCancel
+            container.invalidate()
+            tui.requestRender()
           } else {
-            done({ action: "cancel" })
+            done("cancel")
           }
         }
         container.addChild(selectList)
 
+        const wrapText = (text: string, width: number, maxLines: number): string[] => {
+          const lines: string[] = []
+          const words = text.split(" ")
+          let currentLine = ""
+
+          for (const word of words) {
+            const testLine = currentLine ? `${currentLine} ${word}` : word
+            if (stripAnsi(testLine).length <= width) {
+              currentLine = testLine
+            } else {
+              if (currentLine) lines.push(currentLine)
+              if (lines.length >= maxLines) break
+              currentLine = word
+            }
+          }
+          if (currentLine && lines.length < maxLines) lines.push(currentLine)
+          return lines.slice(0, maxLines)
+        }
+
+        // Build description preview with word wrapping, capped at 7 visual lines
+        const buildDescText = (descLines: string[], width: number): string => {
+          const wrappedLines: string[] = []
+          for (const line of descLines) {
+            const wrapped = wrapText(line, width, 7 - wrappedLines.length)
+            wrappedLines.push(...wrapped)
+            if (wrappedLines.length >= 7) break
+          }
+          while (wrappedLines.length < 7) wrappedLines.push("")
+          return wrappedLines.join("\n")
+        }
+
+        const descTextComponent = new Text(buildDescText([], 80), 0, 0)
+        container.addChild(new Text("", 1, 0)) // Empty line
+        container.addChild(descTextComponent)
+
+        let lastWidth = 80
+
+        const updateDescPreview = () => {
+          const selected = selectList.getSelectedItem()
+          if (selected) {
+            descScroll = 0
+            const issue = displayIssues.find(i => i.id === selected.value)
+            if (issue) {
+              const descLines = truncateDescription(issue.description, 100)
+              descTextComponent.setText(buildDescText(descLines, lastWidth))
+            }
+          }
+        }
+        if (items[0]) updateDescPreview()
+
         container.addChild(new DynamicBorder((s: string) => theme.fg("muted", s)))
-        container.addChild(descPreview)
 
         const helpText = new Text("", 1, 0)
         container.addChild(helpText)
+
+        const shortcutsText = new Text(theme.fg("dim", "0-4 priority • space status • j/k scroll"), 1, 0)
+        container.addChild(shortcutsText)
+
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
 
-        // Update title and help text based on current state
         const refreshDisplay = () => {
           if (searching) {
             titleText.setText(theme.fg("accent", theme.bold(`Search: ${searchBuffer}_`)))
@@ -265,17 +342,81 @@ export default function beadsTasks(pi: ExtensionAPI) {
             filtered: !!filterTerm,
             allowPriority,
             allowSearch,
-          })))
+          }) + " • j/k scroll"))
         }
         refreshDisplay()
 
+        // Re-render helper - rebuild entire container to maintain component order
+        const rebuildAndRender = () => {
+          items = getItems()
+          const prevSelected = selectList.getSelectedItem()
+
+          // Clear and rebuild container
+          while (container.children && container.children.length > 0) {
+            container.removeChild(container.children[0])
+          }
+
+          // Recreate SelectList
+          selectList = new SelectList(items, Math.min(items.length, 10), {
+            selectedPrefix: (t: string) => theme.fg("accent", t),
+            selectedText: (t: string) => theme.fg("accent", t),
+            description: (t: string) => theme.fg("muted", t),
+            scrollInfo: (t: string) => theme.fg("dim", t),
+            noMatch: (t: string) => theme.fg("warning", t),
+          })
+
+          selectList.onSelectionChange = () => {
+            updateDescPreview()
+            tui.requestRender()
+          }
+          selectList.onSelect = () => done("select")
+          selectList.onCancel = () => {
+            if (filterTerm) {
+              filterTerm = ""
+              rebuildAndRender()
+            } else {
+              done("cancel")
+            }
+          }
+
+          // Rebuild container in exact same order
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
+          container.addChild(titleText)
+          container.addChild(selectList)
+          container.addChild(new Text("", 1, 0)) // Empty line
+          container.addChild(descTextComponent)
+          container.addChild(new DynamicBorder((s: string) => theme.fg("muted", s)))
+          container.addChild(helpText)
+          container.addChild(shortcutsText)
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
+
+          // Restore selection
+          if (prevSelected) {
+            const newIdx = items.findIndex(i => i.value === prevSelected.value)
+            if (newIdx >= 0) selectList.setSelectedIndex(newIdx)
+          }
+
+          refreshDisplay()
+          updateDescPreview()
+          container.invalidate()
+          tui.requestRender()
+        }
+
         return {
-          render: (w: number) => safeRender(container, w),
+          render: (w: number) => {
+            lastWidth = w
+            return container.render(w).map((l: string) => truncateToWidth(l, w))
+          },
           invalidate: () => container.invalidate(),
           handleInput: (data: string) => {
+            // Ctrl+q or esc cancels
+            if (data === CTRL_Q || matchesKey(data, Key.escape)) {
+              done("cancel")
+              return
+            }
+
             if (searching) {
-              if (data === "\x1b") {
-                // Esc: cancel search, keep existing filter
+              if (matchesKey(data, Key.escape)) {
                 searching = false
                 searchBuffer = ""
                 refreshDisplay()
@@ -283,14 +424,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
                 tui.requestRender()
                 return
               }
-              if (data === "\r") {
-                // Enter: apply filter
-                const term = searchBuffer.trim()
-                done({ action: "applyFilter", term })
+              if (matchesKey(data, Key.enter)) {
+                filterTerm = searchBuffer.trim()
+                searching = false
+                rebuildAndRender()
+                refreshDisplay()
                 return
               }
-              if (data === "\x7f" || data === "\b") {
-                // Backspace
+              if (matchesKey(data, Key.backspace)) {
                 searchBuffer = searchBuffer.slice(0, -1)
                 refreshDisplay()
                 container.invalidate()
@@ -304,10 +445,9 @@ export default function beadsTasks(pi: ExtensionAPI) {
                 tui.requestRender()
                 return
               }
-              return // ignore other keys in search mode
+              return
             }
 
-            // Normal mode
             if (allowSearch && data === CTRL_F) {
               searching = true
               searchBuffer = ""
@@ -317,161 +457,337 @@ export default function beadsTasks(pi: ExtensionAPI) {
               return
             }
 
+            // Toggle status with space
+            if (data === " ") {
+              const selected = selectList.getSelectedItem()
+              if (selected) {
+                const issue = displayIssues.find(i => i.id === selected.value)
+                if (issue) {
+                  const newStatus = cycleStatus(issue.status)
+                  issue.status = newStatus
+                  updateIssue(issue.id, ["--status", newStatus])
+                  rebuildAndRender()
+                }
+              }
+              return
+            }
+
             if (allowPriority) {
               const p = parsePriorityKey(data)
               if (p !== null) {
                 const selected = selectList.getSelectedItem()
                 if (selected) {
-                  done({ action: "priority", id: selected.value, priority: p })
-                  return
+                  const issue = displayIssues.find(i => i.id === selected.value)
+                  if (issue && issue.priority !== p) {
+                    issue.priority = p
+                    updateIssue(issue.id, ["--priority", String(p)])
+                    rebuildAndRender()
+                  }
                 }
+                return
               }
             }
 
-            selectList.handleInput?.(data)
+            // Description scrolling with j/k
+            if (data === "j" || data === "k") {
+              const selected = selectList.getSelectedItem()
+              if (selected) {
+                const issue = displayIssues.find(i => i.id === selected.value)
+                if (issue) {
+                  const descLines = truncateDescription(issue.description, 100)
+                  // Calculate total wrapped lines
+                  const allWrapped: string[] = []
+                  for (const line of descLines) {
+                    const wrapped = wrapText(line, lastWidth, 100)
+                    allWrapped.push(...wrapped)
+                  }
+                  const maxScroll = Math.max(0, allWrapped.length - 7)
+                  if (data === "j" && descScroll < maxScroll) {
+                    descScroll++
+                  } else if (data === "k" && descScroll > 0) {
+                    descScroll--
+                  }
+                  // Show 7 lines starting from scroll position
+                  const visible = allWrapped.slice(descScroll, descScroll + 7)
+                  while (visible.length < 7) visible.push("")
+                  descTextComponent.setText(visible.join("\n"))
+                  container.invalidate()
+                  tui.requestRender()
+                }
+              }
+              return
+            }
+
+            selectList.handleInput(data)
             tui.requestRender()
           },
         }
       })
 
-      // Handle internal filter actions before returning to caller
-      if (result.action === "applyFilter") {
-        filterTerm = result.term
-        continue
-      }
-      if (result.action === "clearFilter") {
-        filterTerm = ""
-        continue
-      }
+      if (result === "cancel") return { action: "cancel" }
+      if (result === "select") {
+        // Find selected issue
+        const filtered = filterTerm
+          ? displayIssues.filter(i => matchesFilter(i, filterTerm))
+          : displayIssues
+        const items = filtered.map((issue) => ({
+          value: issue.id,
+          label: formatIssueLabel(issue, maxLabelWidth),
+          description: formatIssueDescription(issue),
+        }))
+        const selectedId = items[0]?.value
 
-      return result as ViewResult
+        if (selectedId) {
+          const updated = await editIssue(ctx, selectedId)
+          if (updated) {
+            const idx = displayIssues.findIndex(i => i.id === selectedId)
+            if (idx !== -1) {
+              displayIssues[idx] = updated
+            }
+          }
+        }
+        continue
+      }
     }
   }
 
-  async function viewIssueDetails(ctx: ExtensionCommandContext, issue: BdIssue): Promise<void> {
-    const text = [
-      `# ${issue.id}: ${issue.title}`,
-      "",
-      `- status: ${issue.status}`,
-      `- priority: P${issue.priority ?? "?"}`,
-      `- type: ${issue.issue_type ?? "(unknown)"}`,
-      issue.owner ? `- owner: ${issue.owner}` : undefined,
-      issue.updated_at ? `- updated: ${issue.updated_at}` : undefined,
-      "",
-      "## Description",
-      "",
-      issue.description?.trim() ? issue.description : "(empty)",
-    ]
-      .filter((l): l is string => l !== undefined)
-      .join("\n")
-
-    await ctx.ui.editor("Issue details (Esc to close)", text)
-  }
-
-  async function editIssue(ctx: ExtensionCommandContext, id: string): Promise<void> {
+  // Issue form editor with inline editable fields
+  async function editIssue(ctx: ExtensionCommandContext, id: string): Promise<BdIssue | null> {
     let issue = await showIssue(id)
 
-    const menuItems: SelectItem[] = [
-      { value: "view", label: "View details" },
-      { value: "title", label: "Edit title" },
-      { value: "description", label: "Edit description" },
-      { value: "status", label: "Set status" },
-      { value: "back", label: "Back" },
-    ]
-
     while (true) {
-      const result = await ctx.ui.custom<ViewResult>((tui: any, theme: any, _kb: any, done: any) => {
-        const container = new Container()
+      let titleValue = issue.title
+      let descValue = issue.description ?? ""
+      let statusValue = issue.status
+      let priorityValue = issue.priority
+      let focused: "nav" | "title" | "desc" = "nav"
+      let titleCursor = issue.title.length
+      let descCursor = (issue.description ?? "").length
 
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
-
-        const header = `${formatPriority(issue.priority)} ${issue.id}: ${issue.title}`
-        container.addChild(new Text(theme.fg("accent", theme.bold(header)), 1, 0))
-
-        const statusLine = `${issue.status} • ${issue.issue_type ?? "issue"}`
-        container.addChild(new Text(theme.fg("muted", statusLine), 1, 0))
-
-        const selectList = new SelectList(menuItems, menuItems.length, {
-          selectedPrefix: (t: string) => theme.fg("accent", t),
-          selectedText: (t: string) => theme.fg("accent", t),
-          description: (t: string) => theme.fg("muted", t),
-          scrollInfo: (t: string) => theme.fg("dim", t),
-          noMatch: (t: string) => theme.fg("warning", t),
-        })
-
-        selectList.onSelect = (item: SelectItem) => done({ action: "select", id: item.value })
-        selectList.onCancel = () => done({ action: "cancel" })
-        container.addChild(selectList)
-
-        container.addChild(new DynamicBorder((s: string) => theme.fg("muted", s)))
-        const descLines = truncateDescription(issue.description, 5)
-        container.addChild(new Text(descLines.map((l) => theme.fg("dim", l)).join("\n"), 1, 0))
-
-        container.addChild(new Text(theme.fg("dim", HELP_EDIT), 1, 0))
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
-
+      const result = await ctx.ui.custom<boolean>((tui: any, theme: any, _kb: any, done: any) => {
         return {
-          render: (w: number) => safeRender(container, w),
-          invalidate: () => container.invalidate(),
+          render: (w: number) => {
+            const lines: string[] = []
+            lines.push("─".repeat(Math.min(50, w)))
+            const shortId = stripIdPrefix(issue.id)
+            const headerText = `${formatPriority(priorityValue)} ${shortId} [${statusValue}]`
+            lines.push(truncateToWidth(headerText, w))
+            lines.push("")
+            lines.push(focused === "title" ? "▸ Title:" : "  Title:")
+            if (focused === "title") {
+              const before = titleValue.slice(0, titleCursor)
+              const after = titleValue.slice(titleCursor)
+              lines.push(truncateToWidth(`   ${before}${CURSOR_MARKER}${after}`, w))
+            } else {
+              lines.push(truncateToWidth(`   ${titleValue}`, w))
+            }
+            lines.push("")
+            lines.push(focused === "desc" ? "▸ Description:" : "  Description:")
+            const descLines = descValue.split("\n")
+            let cursorLineIdx = 0
+            let cursorCol = 0
+            let charsConsumed = 0
+            for (let i = 0; i < descLines.length; i++) {
+              if (charsConsumed + descLines[i].length >= descCursor) {
+                cursorLineIdx = i
+                cursorCol = descCursor - charsConsumed
+                break
+              }
+              charsConsumed += descLines[i].length + 1
+            }
+            const startLine = Math.max(0, cursorLineIdx - 2)
+            const endLine = Math.min(descLines.length, startLine + 5)
+            for (let i = startLine; i < endLine; i++) {
+              const line = descLines[i]
+              if (focused === "desc" && i === cursorLineIdx) {
+                const before = line.slice(0, cursorCol)
+                const after = line.slice(cursorCol)
+                lines.push(truncateToWidth(`   ${before}${CURSOR_MARKER}${after}`, w))
+              } else {
+                lines.push(truncateToWidth(`   ${line}`, w))
+              }
+            }
+            lines.push("")
+            let help: string
+            if (focused === "title") {
+              help = "type | backspace | enter save | tab desc | esc cancel"
+            } else if (focused === "desc") {
+              help = "type | backspace | arrows | enter save | tab nav | esc cancel"
+            } else {
+              help = "tab nav | space status | 1-5 priority | esc/ctrl+c back"
+            }
+            lines.push(truncateToWidth(help, w))
+            lines.push("─".repeat(Math.min(50, w)))
+            return lines
+          },
+          invalidate: () => {},
           handleInput: (data: string) => {
-            const p = parsePriorityKey(data)
-            if (p !== null) {
-              done({ action: "priority", id: issue.id, priority: p })
+            if (matchesKey(data, Key.tab)) {
+              focused = focused === "nav" ? "title" : focused === "title" ? "desc" : "nav"
+              tui.requestRender()
               return
             }
-            selectList.handleInput?.(data)
-            tui.requestRender()
+            if (matchesKey(data, Key.escape)) {
+              if (focused !== "nav") {
+                if (focused === "title") {
+                  titleValue = issue.title
+                  titleCursor = issue.title.length
+                } else {
+                  descValue = issue.description ?? ""
+                  descCursor = (issue.description ?? "").length
+                }
+                focused = "nav"
+              } else {
+                done(false)
+                return
+              }
+              tui.requestRender()
+              return
+            }
+            if (matchesKey(data, Key.ctrl("c"))) {
+              done(false)
+              return
+            }
+            if (matchesKey(data, Key.enter)) {
+              if (focused !== "nav") {
+                focused = "nav"
+                done(true)
+                return
+              }
+              tui.requestRender()
+              return
+            }
+            if (focused === "nav") {
+              if (matchesKey(data, Key.space)) {
+                statusValue = cycleStatus(statusValue)
+                tui.requestRender()
+                return
+              }
+              const p = parsePriorityKey(data)
+              if (p !== null) {
+                priorityValue = p
+                tui.requestRender()
+                return
+              }
+              return
+            }
+            if (focused === "title") {
+              if (matchesKey(data, Key.backspace) && titleCursor > 0) {
+                titleValue = titleValue.slice(0, titleCursor - 1) + titleValue.slice(titleCursor)
+                titleCursor--
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.left) && titleCursor > 0) {
+                titleCursor--
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.right) && titleCursor < titleValue.length) {
+                titleCursor++
+                tui.requestRender()
+                return
+              }
+              if (isPrintable(data)) {
+                titleValue = titleValue.slice(0, titleCursor) + data + titleValue.slice(titleCursor)
+                titleCursor++
+                tui.requestRender()
+                return
+              }
+              return
+            }
+            if (focused === "desc") {
+              if (matchesKey(data, Key.backspace) && descCursor > 0) {
+                descValue = descValue.slice(0, descCursor - 1) + descValue.slice(descCursor)
+                descCursor--
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.left) && descCursor > 0) {
+                descCursor--
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.right) && descCursor < descValue.length) {
+                descCursor++
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.up)) {
+                let lineStart = descCursor
+                while (lineStart > 0 && descValue[lineStart - 1] !== "\n") lineStart--
+                if (lineStart > 0) {
+                  let prevLineStart = lineStart - 1
+                  while (prevLineStart > 0 && descValue[prevLineStart - 1] !== "\n") prevLineStart--
+                  const colInLine = descCursor - lineStart
+                  const prevLineLen = lineStart - 1 - prevLineStart
+                  descCursor = prevLineStart + Math.min(colInLine, prevLineLen)
+                }
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.down)) {
+                let lineStart = descCursor
+                while (lineStart > 0 && descValue[lineStart - 1] !== "\n") lineStart--
+                const colInLine = descCursor - lineStart
+                let nextLineStart = lineStart
+                while (nextLineStart < descValue.length && descValue[nextLineStart] !== "\n") nextLineStart++
+                nextLineStart++
+                if (nextLineStart < descValue.length) {
+                  let nextLineEnd = nextLineStart
+                  while (nextLineEnd < descValue.length && descValue[nextLineEnd] !== "\n") nextLineEnd++
+                  const nextLineLen = nextLineEnd - nextLineStart
+                  descCursor = nextLineStart + Math.min(colInLine, nextLineLen)
+                }
+                tui.requestRender()
+                return
+              }
+              if (matchesKey(data, Key.enter)) {
+                descValue = descValue.slice(0, descCursor) + "\n" + descValue.slice(descCursor)
+                descCursor++
+                tui.requestRender()
+                return
+              }
+              if (isPrintable(data)) {
+                descValue = descValue.slice(0, descCursor) + data + descValue.slice(descCursor)
+                descCursor++
+                tui.requestRender()
+                return
+              }
+            }
           },
         }
       })
 
-      if (result.action === "cancel" || (result.action === "select" && result.id === "back")) return
+      if (!result) return null
 
-      if (result.action === "priority") {
-        await updateIssue(id, ["--priority", String(result.priority)])
-        issue = await showIssue(id)
-        ctx.ui.notify(`Priority set to P${result.priority}`, "success")
-        continue
+      let changed = false
+      if (titleValue.trim() !== issue.title.trim()) {
+        await updateIssue(id, ["--title", titleValue.trim()])
+        ctx.ui.notify("Title updated", "success")
+        issue.title = titleValue.trim()
+        changed = true
+      }
+      if (descValue !== (issue.description ?? "")) {
+        await updateIssue(id, ["--description", descValue])
+        ctx.ui.notify("Description updated", "success")
+        issue.description = descValue
+        changed = true
+      }
+      if (statusValue !== issue.status) {
+        await updateIssue(id, ["--status", statusValue])
+        ctx.ui.notify(`Status: ${statusValue}`, "success")
+        issue.status = statusValue
+        changed = true
+      }
+      if (priorityValue !== issue.priority) {
+        await updateIssue(id, ["--priority", String(priorityValue)])
+        ctx.ui.notify(`Priority: P${priorityValue}`, "success")
+        issue.priority = priorityValue
+        changed = true
       }
 
-      if (result.action === "select") {
-        if (result.id === "view") {
-          await viewIssueDetails(ctx, issue)
-          continue
-        }
-
-        if (result.id === "title") {
-          const next = await ctx.ui.editor("Title:", issue.title)
-          if (next === undefined) continue
-          const trimmed = next.trim().split(/\r?\n/)[0] ?? ""
-          if (trimmed.length === 0) {
-            ctx.ui.notify("Title cannot be empty", "warning")
-            continue
-          }
-          await updateIssue(id, ["--title", trimmed])
-          issue = await showIssue(id)
-          ctx.ui.notify("Title updated", "success")
-          continue
-        }
-
-        if (result.id === "description") {
-          const next = await ctx.ui.editor("Description:", issue.description ?? "")
-          if (next === undefined) continue
-          await updateIssue(id, ["--description", next])
-          issue = await showIssue(id)
-          ctx.ui.notify("Description updated", "success")
-          continue
-        }
-
-        if (result.id === "status") {
-          const next = await ctx.ui.select("Status:", ["open", "in_progress", "blocked", "deferred", "closed"])
-          if (!next) continue
-          await updateIssue(id, ["--status", next])
-          issue = await showIssue(id)
-          ctx.ui.notify("Status updated", "success")
-          continue
-        }
-      }
+      return issue
     }
   }
 
@@ -481,22 +797,32 @@ export default function beadsTasks(pi: ExtensionAPI) {
     while (true) {
       try {
         ctx.ui.setStatus("beads", "Loading…")
-        const issues = await listIssues(mode)
+        let issues = await listIssues(mode)
         ctx.ui.setStatus("beads", undefined)
 
-        const result = await showIssueList(ctx, { title: modeTitle, issues })
+        while (true) {
+          const result = await showIssueList(ctx, { title: modeTitle, issues })
 
-        if (result.action === "cancel") return
+          if (result.action === "cancel") return
 
-        if (result.action === "priority") {
-          await updateIssue(result.id, ["--priority", String(result.priority)])
-          ctx.ui.notify(`Priority set to P${result.priority}`, "success")
-          continue
-        }
+          if (result.action === "priority") {
+            await updateIssue(result.id, ["--priority", String(result.priority)])
+            issues = issues.map(i =>
+              i.id === result.id ? { ...i, priority: result.priority } : i
+            )
+            ctx.ui.notify(`Priority set to P${result.priority}`, "success")
+            continue
+          }
 
-        if (result.action === "select") {
-          await editIssue(ctx, result.id)
-          continue
+          if (result.action === "select") {
+            const updated = await editIssue(ctx, result.id)
+            if (updated) {
+              issues = issues.map(i =>
+                i.id === result.id ? updated : i
+              )
+            }
+            continue
+          }
         }
       } catch (e) {
         ctx.ui.setStatus("beads", undefined)
@@ -507,12 +833,10 @@ export default function beadsTasks(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("beads", {
-    description: "Browse and edit Beads issues (list + edit fields)",
+    description: "Browse and edit Beads issues",
     handler: async (rawArgs, ctx) => {
       if (!ctx.hasUI) return
-
       const args = (rawArgs || "").trim()
-
       if (args.length > 0 && isLikelyIssueId(args)) {
         try {
           await editIssue(ctx, args)
@@ -521,13 +845,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         }
         return
       }
-
-      const mode = ((): ListMode => {
-        if (args === "open") return "open"
-        if (args === "all") return "all"
-        return "ready"
-      })()
-
+      const mode = args === "open" ? "open" : args === "all" ? "all" : "ready"
       await browseIssues(ctx, mode)
     },
   })

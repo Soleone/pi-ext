@@ -1,13 +1,15 @@
 import { Container, Key, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-tui"
 import { DynamicBorder, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
 import {
+  buildIssueIdentityText,
   buildIssueListTextParts,
+  formatIssueTypeCode,
   type BdIssue,
   type IssueStatus,
 } from "../beads-task-view-model.ts"
 import { BlurEditorField } from "./blur-editor-field.ts"
 import { MinHeightContainer } from "./min-height-container.ts"
-import { KEYBOARD_HELP_PADDING_X } from "./keyboard-help-style.ts"
+import { formatKeyboardHelp, KEYBOARD_HELP_PADDING_X } from "./keyboard-help-style.ts"
 
 export type IssueFormFocus = "nav" | "title" | "desc"
 
@@ -44,7 +46,11 @@ function isSameDraft(a: IssueFormDraft, b: IssueFormDraft): boolean {
   )
 }
 
+type TaskFormMode = "edit" | "create"
+
 interface ShowIssueFormOptions {
+  mode: TaskFormMode
+  subtitle: string
   issue: BdIssue
   ctrlQ: string
   cycleStatus: (status: IssueStatus) => IssueStatus
@@ -144,7 +150,7 @@ class ReservedLineText implements Component {
 }
 
 export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowIssueFormOptions): Promise<IssueFormResult> {
-  const { issue, ctrlQ, cycleStatus, cycleIssueType, parsePriorityKey, onSave } = options
+  const { mode, subtitle, issue, ctrlQ, cycleStatus, cycleIssueType, parsePriorityKey, onSave } = options
 
   let issueTypeValue = issue.issue_type
   let titleValue = issue.title
@@ -170,7 +176,7 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
     const helpText = new ReservedLineText(KEYBOARD_HELP_PADDING_X)
     const shortcutsText = new ReservedLineText(KEYBOARD_HELP_PADDING_X)
 
-    let focus: IssueFormFocus = "nav"
+    let focus: IssueFormFocus = mode === "create" ? "title" : "nav"
     let saveIndicator: "saving" | "saved" | "error" | undefined
     let saveIndicatorTimer: ReturnType<typeof setTimeout> | undefined
     let saving = false
@@ -289,7 +295,7 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
                 ? { message: "Editing description", icon: undefined as string | undefined, color: "accent" as const }
                 : undefined
 
-      const pageTitle = theme.fg("muted", theme.bold("Tasks"))
+      const pageTitle = `${theme.fg("muted", theme.bold("Tasks"))}${theme.fg("dim", ` • ${subtitle}`)}`
       if (!headerStatus) {
         pageTitleText.setText(pageTitle)
       } else {
@@ -297,7 +303,14 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
         const statusText = theme.fg(headerStatus.color, headerStatus.message)
         pageTitleText.setText(`${pageTitle} ${marker} ${statusText}`)
       }
-      selectedTaskText.setText(`${theme.fg("accent", SELECTED_ITEM_PREFIX)}${rowParts.identity} ${rowParts.meta}`)
+
+      if (mode === "create") {
+        const identity = buildIssueIdentityText(priorityValue, "new")
+        const typeCode = formatIssueTypeCode(issueTypeValue)
+        selectedTaskText.setText(`${theme.fg("accent", SELECTED_ITEM_PREFIX)}${identity} ${typeCode}`)
+      } else {
+        selectedTaskText.setText(`${theme.fg("accent", SELECTED_ITEM_PREFIX)}${rowParts.identity} ${rowParts.meta}`)
+      }
       titleLabel.setText(
         focus === "title"
           ? theme.fg("accent", theme.bold("  Title"))
@@ -309,9 +322,9 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
           : theme.fg("muted", theme.bold("  Description")),
       )
 
-      helpText.setText(theme.fg("dim", buildPrimaryHelpText(focus)))
+      helpText.setText(formatKeyboardHelp(theme, buildPrimaryHelpText(focus)))
       const secondaryHelp = buildSecondaryHelpText(focus)
-      shortcutsText.setText(secondaryHelp ? theme.fg("dim", secondaryHelp) : "")
+      shortcutsText.setText(secondaryHelp ? formatKeyboardHelp(theme, secondaryHelp) : "")
 
       container.invalidate()
       tui.requestRender()

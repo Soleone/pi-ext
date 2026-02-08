@@ -80,6 +80,10 @@ function stripIdPrefix(id: string): string {
   return idx >= 0 ? id.slice(idx + 1) : id
 }
 
+export function formatIssueTypeCode(issueType: string | undefined): string {
+  return (issueType || "issue").slice(0, 4).padEnd(4)
+}
+
 export function formatIssueStatusSymbol(status: IssueStatus): string {
   return STATUS_SYMBOLS[status] ?? "?"
 }
@@ -112,17 +116,21 @@ function buildIssueListElements(issue: BdIssue): IssueListElements {
     id: stripIdPrefix(issue.id),
     title: issue.title,
     status: formatIssueStatusSymbol(issue.status),
-    type: (issue.issue_type || "issue").slice(0, 4).padEnd(4),
+    type: formatIssueTypeCode(issue.issue_type),
     summary: firstLine(issue.description),
   }
 }
 
+export function buildIssueIdentityText(priority: number | undefined, idText: string): string {
+  const mutedId = `${MUTED_TEXT}${idText}${ANSI_RESET}`
+  return `${formatIssuePriority(priority)} ${mutedId}`
+}
+
 export function buildIssueListTextParts(issue: BdIssue): IssueListTextParts {
   const elements = buildIssueListElements(issue)
-  const mutedId = `${MUTED_TEXT}${elements.id}${ANSI_RESET}`
 
   return {
-    identity: `${elements.priority} ${mutedId}`,
+    identity: buildIssueIdentityText(issue.priority, elements.id),
     title: elements.title,
     meta: `${elements.status} ${elements.type}`,
     summary: elements.summary,

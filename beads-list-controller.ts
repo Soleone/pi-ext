@@ -14,6 +14,7 @@ export type ListIntent =
   | { type: "setPriority"; priority: number }
   | { type: "scrollDescription"; delta: number }
   | { type: "toggleType" }
+  | { type: "create" }
   | { type: "reference" }
   | { type: "delegate" }
 
@@ -122,6 +123,12 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     help: "t type",
     match: (data) => data === "t" || data === "T",
     intent: () => ({ type: "toggleType" }),
+  },
+  {
+    context: "default",
+    help: "c create",
+    match: (data) => data === "c" || data === "C",
+    intent: () => ({ type: "create" }),
   },
   {
     context: "default",

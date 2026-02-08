@@ -18,12 +18,13 @@ import {
 } from "./beads-list-controller.ts"
 import { showIssueForm } from "./components/beads-issue-show-view.ts"
 import { MinHeightContainer } from "./components/min-height-container.ts"
-import { KEYBOARD_HELP_PADDING_X } from "./components/keyboard-help-style.ts"
+import { formatKeyboardHelp, KEYBOARD_HELP_PADDING_X } from "./components/keyboard-help-style.ts"
 
 type ListMode = "ready" | "open" | "all"
 
 interface IssueListConfig {
   title: string
+  subtitle?: string
   issues: BdIssue[]
   allowPriority?: boolean
   allowSearch?: boolean
@@ -52,6 +53,19 @@ function parseJsonArray<T>(stdout: string, context: string): T[] {
     const parsed = JSON.parse(stdout)
     if (!Array.isArray(parsed)) throw new Error("expected JSON array")
     return parsed as T[]
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    throw new Error(`Failed to parse bd output (${context}): ${msg}`)
+  }
+}
+
+function parseJsonObject<T>(stdout: string, context: string): T {
+  try {
+    const parsed = JSON.parse(stdout)
+    if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+      throw new Error("expected JSON object")
+    }
+    return parsed as T
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     throw new Error(`Failed to parse bd output (${context}): ${msg}`)
@@ -138,7 +152,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
 
   // Issue list with description preview and priority hotkeys.
   async function showIssueList(ctx: ExtensionCommandContext, config: IssueListConfig): Promise<void> {
-    const { title, issues, allowPriority = true, allowSearch = true } = config
+    const { title, subtitle, issues, allowPriority = true, allowSearch = true } = config
 
     if (issues.length === 0) {
       ctx.ui.notify("No issues found", "info")
@@ -166,7 +180,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
       ))
 
       let selectedId: string | undefined
-      const result = await ctx.ui.custom<"cancel" | "select">((tui: any, theme: any, _kb: any, done: any) => {
+      const result = await ctx.ui.custom<"cancel" | "select" | "create">((tui: any, theme: any, _kb: any, done: any) => {
         const container = new Container()
         let searching = false
         let searchBuffer = ""
@@ -356,7 +370,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         headerContainer.addChild(titleText)
 
         const helpText = new Text("", KEYBOARD_HELP_PADDING_X, 0)
-        const shortcutsText = new Text(theme.fg("dim", buildListSecondaryHelpText()), KEYBOARD_HELP_PADDING_X, 0)
+        const shortcutsText = new Text(formatKeyboardHelp(theme, buildListSecondaryHelpText()), KEYBOARD_HELP_PADDING_X, 0)
 
         footerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
         footerContainer.addChild(helpText)
@@ -371,9 +385,10 @@ export default function beadsTasks(pi: ExtensionAPI) {
           } else if (filterTerm) {
             titleText.setText(theme.fg("muted", theme.bold(`${title} [filter: ${filterTerm}]`)))
           } else {
-            titleText.setText(theme.fg("muted", theme.bold(title)))
+            const subtitlePart = subtitle ? theme.fg("dim", ` • ${subtitle}`) : ""
+            titleText.setText(`${theme.fg("muted", theme.bold(title))}${subtitlePart}`)
           }
-          helpText.setText(theme.fg("dim", buildListPrimaryHelpText({
+          helpText.setText(formatKeyboardHelp(theme, buildListPrimaryHelpText({
             searching,
             filtered: !!filterTerm,
             allowPriority,
@@ -590,6 +605,10 @@ export default function beadsTasks(pi: ExtensionAPI) {
                 return
               }
 
+              case "create":
+                done("create")
+                return
+
               case "reference": {
                 const issue = getSelectedIssue()
                 if (issue) {
@@ -609,6 +628,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
       })
 
       if (result === "cancel") return
+      if (result === "create") {
+        const createdIssue = await createIssue(ctx)
+        if (createdIssue) {
+          displayIssues.unshift(createdIssue)
+          rememberedSelectedId = createdIssue.id
+        }
+        continue
+      }
       if (result === "select" && selectedId) {
         rememberedSelectedId = selectedId
         const currentIssue = displayIssues.find(i => i.id === selectedId)
@@ -668,6 +695,8 @@ export default function beadsTasks(pi: ExtensionAPI) {
     let issue = await getIssueForEdit(id, fromList)
 
     const formResult = await showIssueForm(ctx, {
+      mode: "edit",
+      subtitle: "Edit",
       issue,
       ctrlQ: CTRL_Q,
       cycleStatus,
@@ -703,14 +732,97 @@ export default function beadsTasks(pi: ExtensionAPI) {
     }
   }
 
+  async function createIssue(ctx: ExtensionCommandContext): Promise<BdIssue | null> {
+    let createdIssue: BdIssue | null = null
+
+    await showIssueForm(ctx, {
+      mode: "create",
+      subtitle: "Create",
+      issue: {
+        id: "new",
+        title: "",
+        description: "",
+        status: "open",
+        priority: 2,
+        issue_type: "task",
+      },
+      ctrlQ: CTRL_Q,
+      cycleStatus,
+      cycleIssueType,
+      parsePriorityKey,
+      onSave: async (draft) => {
+        const title = draft.title.trim()
+        if (title.length === 0) {
+          throw new Error("Title is required")
+        }
+
+        if (!createdIssue) {
+          const createArgs = [
+            "create",
+            "--title", title,
+            "--priority", String(draft.priority ?? 2),
+            "--type", draft.issueType || "task",
+            "--json",
+          ]
+
+          if (draft.description.length > 0) {
+            createArgs.splice(3, 0, "--description", draft.description)
+          }
+
+          const out = await execBd(createArgs)
+          const created = parseJsonObject<BdIssue>(out, "create")
+
+          if (draft.status !== "open" && created.id) {
+            await updateIssue(created.id, ["--status", draft.status])
+            created.status = draft.status
+          }
+
+          createdIssue = {
+            ...created,
+            title,
+            description: draft.description,
+            status: draft.status,
+            priority: draft.priority,
+            issue_type: draft.issueType,
+          }
+          return true
+        }
+
+        const updateArgs = buildIssueUpdateArgs(createdIssue, {
+          title,
+          description: draft.description,
+          status: draft.status,
+          priority: draft.priority,
+          issueType: draft.issueType,
+        })
+
+        if (updateArgs.length === 0) return false
+
+        await updateIssue(createdIssue.id, updateArgs)
+        createdIssue = {
+          ...createdIssue,
+          title,
+          description: draft.description,
+          status: draft.status,
+          priority: draft.priority,
+          issue_type: draft.issueType,
+        }
+        return true
+      },
+    })
+
+    return createdIssue
+  }
+
   async function browseIssues(ctx: ExtensionCommandContext, mode: ListMode): Promise<void> {
     const modeTitle = "Tasks"
+    const modeSubtitle = mode === "ready" ? "Ready" : mode === "open" ? "Open" : "All"
 
     try {
       ctx.ui.setStatus("beads", "Loading…")
       const issues = await listIssues(mode)
       ctx.ui.setStatus("beads", undefined)
-      await showIssueList(ctx, { title: modeTitle, issues })
+      await showIssueList(ctx, { title: modeTitle, subtitle: modeSubtitle, issues })
     } catch (e) {
       ctx.ui.setStatus("beads", undefined)
       ctx.ui.notify(e instanceof Error ? e.message : String(e), "error")

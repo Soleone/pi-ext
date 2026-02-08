@@ -1,0 +1,436 @@
+import { Container, Key, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-tui"
+import { DynamicBorder, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
+import {
+  buildIssueListTextParts,
+  type BdIssue,
+  type IssueStatus,
+} from "../beads-task-view-model.ts"
+import { BlurEditorField } from "./blur-editor-field.ts"
+import { MinHeightContainer } from "./min-height-container.ts"
+import { KEYBOARD_HELP_PADDING_X } from "./keyboard-help-style.ts"
+
+export type IssueFormFocus = "nav" | "title" | "desc"
+
+export type IssueFormAction = "back" | "close_list"
+
+export interface IssueFormResult {
+  action: IssueFormAction
+}
+
+interface IssueFormDraft {
+  title: string
+  description: string
+  status: IssueStatus
+  priority: number | undefined
+  issueType: string | undefined
+}
+
+function normalizeDraft(draft: IssueFormDraft): IssueFormDraft {
+  return {
+    ...draft,
+    title: draft.title.trim(),
+  }
+}
+
+function isSameDraft(a: IssueFormDraft, b: IssueFormDraft): boolean {
+  const left = normalizeDraft(a)
+  const right = normalizeDraft(b)
+  return (
+    left.title === right.title &&
+    left.description === right.description &&
+    left.status === right.status &&
+    left.priority === right.priority &&
+    left.issueType === right.issueType
+  )
+}
+
+interface ShowIssueFormOptions {
+  issue: BdIssue
+  ctrlQ: string
+  cycleStatus: (status: IssueStatus) => IssueStatus
+  cycleIssueType: (issueType: string | undefined) => string
+  parsePriorityKey: (data: string) => number | null
+  onSave: (draft: IssueFormDraft) => Promise<boolean>
+}
+
+function buildPrimaryHelpText(focus: IssueFormFocus): string {
+  if (focus === "title") return "enter save • tab description • esc back"
+  if (focus === "desc") return "enter newline • tab save • esc back"
+  return "tab title • enter save • esc/q back • ctrl+q close"
+}
+
+function buildSecondaryHelpText(focus: IssueFormFocus): string {
+  if (focus !== "nav") return ""
+  return "space status • 0-4 priority • t type"
+}
+
+const SELECTED_ITEM_PREFIX = "› "
+const DESCRIPTION_FIELD_HEIGHT = 8
+const PAGE_CONTENT_MIN_HEIGHT = 19
+
+class FixedHeightField implements Component {
+  constructor(private child: Component, private height: number) {}
+
+  invalidate(): void {
+    this.child.invalidate()
+  }
+
+  render(width: number): string[] {
+    const lines = this.child.render(width)
+
+    if (lines.length === this.height) return lines
+
+    if (lines.length < this.height) {
+      return [...lines, ...Array(this.height - lines.length).fill(" ".repeat(Math.max(0, width)))]
+    }
+
+    if (this.height <= 1) {
+      return [lines[lines.length - 1] || ""]
+    }
+
+    const bottomLine = lines[lines.length - 1] || ""
+    const bodyLines = lines.slice(0, lines.length - 1)
+    const viewportHeight = this.height - 1
+
+    const cursorIndex = bodyLines.findIndex(line => line.includes("\x1b[7m"))
+
+    let start = Math.max(0, bodyLines.length - viewportHeight)
+    if (cursorIndex >= 0) {
+      if (cursorIndex < start) {
+        start = cursorIndex
+      } else if (cursorIndex >= start + viewportHeight) {
+        start = cursorIndex - viewportHeight + 1
+      }
+    }
+
+    const clippedBody = bodyLines.slice(start, start + viewportHeight)
+    if (clippedBody.length < viewportHeight) {
+      clippedBody.push(...Array(viewportHeight - clippedBody.length).fill(" ".repeat(Math.max(0, width))))
+    }
+
+    return [...clippedBody, bottomLine]
+  }
+
+  handleInput(data: string): void {
+    const childWithInput = this.child as Component & { handleInput?: (input: string) => void }
+    childWithInput.handleInput?.(data)
+  }
+}
+
+class ReservedLineText implements Component {
+  private text = ""
+
+  constructor(private paddingX = 1) {}
+
+  setText(text: string): void {
+    this.text = text
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(0, width - this.paddingX * 2)
+    const left = " ".repeat(this.paddingX)
+    const right = " ".repeat(this.paddingX)
+
+    if (!this.text || this.text.trim().length === 0) {
+      return [`${left}${" ".repeat(innerWidth)}${right}`]
+    }
+
+    const content = truncateToWidth(this.text, innerWidth)
+    const trailingPadding = Math.max(0, innerWidth - visibleWidth(content))
+    return [`${left}${content}${" ".repeat(trailingPadding)}${right}`]
+  }
+}
+
+export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowIssueFormOptions): Promise<IssueFormResult> {
+  const { issue, ctrlQ, cycleStatus, cycleIssueType, parsePriorityKey, onSave } = options
+
+  let issueTypeValue = issue.issue_type
+  let titleValue = issue.title
+  let descValue = issue.description ?? ""
+  let statusValue = issue.status
+  let priorityValue = issue.priority
+
+  return ctx.ui.custom<IssueFormResult>((tui: any, theme: any, _kb: any, done: any) => {
+    const container = new Container()
+    const headerContainer = new Container()
+    const formContainer = new Container()
+    const footerContainer = new Container()
+    const paddedFormContainer = new MinHeightContainer(formContainer, PAGE_CONTENT_MIN_HEIGHT)
+
+    container.addChild(headerContainer)
+    container.addChild(paddedFormContainer)
+    container.addChild(footerContainer)
+
+    const pageTitleText = new Text("", 1, 0)
+    const selectedTaskText = new Text("", 0, 0)
+    const titleLabel = new Text("", 0, 0)
+    const descLabel = new Text("", 0, 0)
+    const helpText = new ReservedLineText(KEYBOARD_HELP_PADDING_X)
+    const shortcutsText = new ReservedLineText(KEYBOARD_HELP_PADDING_X)
+
+    let focus: IssueFormFocus = "nav"
+    let saveIndicator: "saving" | "saved" | "error" | undefined
+    let saveIndicatorTimer: ReturnType<typeof setTimeout> | undefined
+    let saving = false
+    let disposed = false
+
+    const editorTheme = {
+      borderColor: (s: string) => theme.fg("accent", s),
+      selectList: {
+        selectedPrefix: (t: string) => theme.fg("accent", t),
+        selectedText: (t: string) => theme.fg("accent", t),
+        description: (t: string) => theme.fg("muted", t),
+        scrollInfo: (t: string) => theme.fg("dim", t),
+        noMatch: (t: string) => theme.fg("warning", t),
+      },
+    }
+
+    const titleEditor = new BlurEditorField(tui, editorTheme, {
+      stripTopBorder: true,
+      blurredBorderColor: (s: string) => theme.fg("muted", s),
+      paddingX: 2,
+      indentX: 2,
+    })
+    titleEditor.setText(titleValue)
+    titleEditor.disableSubmit = true
+    titleEditor.onChange = (text: string) => {
+      const normalized = text.replace(/\r?\n/g, " ")
+      if (normalized !== text) {
+        titleEditor.setText(normalized)
+        return
+      }
+      titleValue = normalized
+    }
+
+    const descEditor = new BlurEditorField(tui, editorTheme, {
+      stripTopBorder: true,
+      blurredBorderColor: (s: string) => theme.fg("muted", s),
+      paddingX: 2,
+      indentX: 2,
+    })
+    const descEditorField = new FixedHeightField(descEditor, DESCRIPTION_FIELD_HEIGHT)
+    descEditor.setText(descValue)
+    descEditor.disableSubmit = true
+    descEditor.onChange = (text: string) => {
+      descValue = text
+    }
+
+    const currentDraft = (): IssueFormDraft => ({
+      title: titleValue,
+      description: descValue,
+      status: statusValue,
+      priority: priorityValue,
+      issueType: issueTypeValue,
+    })
+
+    let lastSavedDraft: IssueFormDraft = currentDraft()
+
+    const triggerSave = async () => {
+      if (saving || disposed) return
+
+      const draft = currentDraft()
+      if (isSameDraft(draft, lastSavedDraft)) return
+
+      saving = true
+      if (saveIndicatorTimer) clearTimeout(saveIndicatorTimer)
+      saveIndicator = "saving"
+      renderLayout()
+
+      try {
+        const didSave = await onSave(draft)
+        if (disposed) return
+        if (!didSave) {
+          saveIndicator = undefined
+          return
+        }
+        lastSavedDraft = normalizeDraft(draft)
+        saveIndicator = "saved"
+      } catch (e) {
+        if (disposed) return
+        saveIndicator = "error"
+        ctx.ui.notify(e instanceof Error ? e.message : String(e), "error")
+      } finally {
+        saving = false
+        if (!disposed) renderLayout()
+      }
+
+      if (saveIndicator === "saved" && !disposed) {
+        saveIndicatorTimer = setTimeout(() => {
+          if (disposed) return
+          saveIndicator = undefined
+          renderLayout()
+        }, 5000)
+      }
+    }
+
+    const renderLayout = () => {
+      titleEditor.focused = focus === "title"
+      descEditor.focused = focus === "desc"
+
+      const rowParts = buildIssueListTextParts({
+        ...issue,
+        title: titleValue,
+        description: descValue,
+        status: statusValue,
+        priority: priorityValue,
+        issue_type: issueTypeValue,
+      })
+      const headerStatus = saveIndicator === "saving"
+        ? { message: "Saving…", icon: "⟳", color: "dim" as const }
+        : saveIndicator === "saved"
+          ? { message: "Saved", icon: "✓", color: "accent" as const }
+          : saveIndicator === "error"
+            ? { message: "Save failed", icon: undefined as string | undefined, color: "warning" as const }
+            : focus === "title"
+              ? { message: "Editing title", icon: undefined as string | undefined, color: "accent" as const }
+              : focus === "desc"
+                ? { message: "Editing description", icon: undefined as string | undefined, color: "accent" as const }
+                : undefined
+
+      const pageTitle = theme.fg("muted", theme.bold("Tasks"))
+      if (!headerStatus) {
+        pageTitleText.setText(pageTitle)
+      } else {
+        const marker = headerStatus.icon ? theme.fg(headerStatus.color, headerStatus.icon) : "•"
+        const statusText = theme.fg(headerStatus.color, headerStatus.message)
+        pageTitleText.setText(`${pageTitle} ${marker} ${statusText}`)
+      }
+      selectedTaskText.setText(`${theme.fg("accent", SELECTED_ITEM_PREFIX)}${rowParts.identity} ${rowParts.meta}`)
+      titleLabel.setText(
+        focus === "title"
+          ? theme.fg("accent", theme.bold("  Title"))
+          : theme.fg("muted", theme.bold("  Title")),
+      )
+      descLabel.setText(
+        focus === "desc"
+          ? theme.fg("accent", theme.bold("  Description"))
+          : theme.fg("muted", theme.bold("  Description")),
+      )
+
+      helpText.setText(theme.fg("dim", buildPrimaryHelpText(focus)))
+      const secondaryHelp = buildSecondaryHelpText(focus)
+      shortcutsText.setText(secondaryHelp ? theme.fg("dim", secondaryHelp) : "")
+
+      container.invalidate()
+      tui.requestRender()
+    }
+
+    headerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
+    headerContainer.addChild(pageTitleText)
+    headerContainer.addChild(selectedTaskText)
+
+    formContainer.addChild(new Spacer(1))
+    formContainer.addChild(titleLabel)
+    formContainer.addChild(titleEditor)
+    formContainer.addChild(new Spacer(1))
+    formContainer.addChild(descLabel)
+    formContainer.addChild(descEditorField)
+
+    footerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
+    footerContainer.addChild(helpText)
+    footerContainer.addChild(shortcutsText)
+    footerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
+
+    renderLayout()
+
+    return {
+      render: (w: number) => container.render(w).map((line: string) => truncateToWidth(line, w)),
+      invalidate: () => container.invalidate(),
+      dispose: () => {
+        disposed = true
+        if (saveIndicatorTimer) clearTimeout(saveIndicatorTimer)
+      },
+      handleInput: (data: string) => {
+        if (data === ctrlQ) {
+          done({ action: "close_list" })
+          return
+        }
+
+        if (focus !== "nav" && (matchesKey(data, Key.escape) || matchesKey(data, Key.left))) {
+          focus = "nav"
+          renderLayout()
+          return
+        }
+
+        if (focus === "title") {
+          if (matchesKey(data, Key.enter)) {
+            focus = "nav"
+            void triggerSave()
+            renderLayout()
+            return
+          }
+
+          if (matchesKey(data, Key.tab)) {
+            focus = "desc"
+            renderLayout()
+            return
+          }
+
+          titleEditor.handleInput(data)
+          container.invalidate()
+          tui.requestRender()
+          return
+        }
+
+        if (focus === "desc") {
+          if (matchesKey(data, Key.enter)) {
+            descEditor.insertTextAtCursor("\n")
+            container.invalidate()
+            tui.requestRender()
+            return
+          }
+
+          if (matchesKey(data, Key.tab)) {
+            focus = "nav"
+            void triggerSave()
+            renderLayout()
+            return
+          }
+
+          descEditor.handleInput(data)
+          container.invalidate()
+          tui.requestRender()
+          return
+        }
+
+        if (focus === "nav") {
+          if (matchesKey(data, Key.enter)) {
+            void triggerSave()
+            return
+          }
+
+          if (matchesKey(data, Key.tab)) {
+            focus = "title"
+            renderLayout()
+            return
+          }
+
+          if (matchesKey(data, Key.escape) || matchesKey(data, Key.left) || data === "q" || data === "Q") {
+            done({ action: "back" })
+            return
+          }
+
+          if (data === "t" || data === "T") {
+            issueTypeValue = cycleIssueType(issueTypeValue)
+            renderLayout()
+            return
+          }
+
+          if (data === " ") {
+            statusValue = cycleStatus(statusValue)
+            renderLayout()
+            return
+          }
+
+          const priority = parsePriorityKey(data)
+          if (priority !== null) {
+            priorityValue = priority
+            renderLayout()
+          }
+        }
+      },
+    }
+  })
+}

@@ -1,16 +1,14 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent"
 import { DynamicBorder } from "@mariozechner/pi-coding-agent"
-import { Container, SelectList, Spacer, Text, matchesKey, Key, truncateToWidth, CURSOR_MARKER } from "@mariozechner/pi-tui"
+import { Container, SelectList, Spacer, Text, truncateToWidth } from "@mariozechner/pi-tui"
 import {
   DESCRIPTION_PART_SEPARATOR,
-  EDIT_HELP_TEXT,
-  buildIssueEditHeader,
   buildIssueListRowModel,
   buildWorkPrompt,
   decodeIssueDescription,
+  serializeIssueReference,
   stripAnsi,
   type BdIssue,
-  type EditFocus,
   type IssueStatus,
 } from "./beads-task-view-model.ts"
 import {
@@ -18,6 +16,9 @@ import {
   buildListSecondaryHelpText,
   resolveListIntent,
 } from "./beads-list-controller.ts"
+import { showIssueForm } from "./components/beads-issue-show-view.ts"
+import { MinHeightContainer } from "./components/min-height-container.ts"
+import { KEYBOARD_HELP_PADDING_X } from "./components/keyboard-help-style.ts"
 
 type ListMode = "ready" | "open" | "all"
 
@@ -30,6 +31,7 @@ interface IssueListConfig {
 }
 
 const MAX_LIST_RESULTS = 200
+const LIST_PAGE_CONTENT_MIN_HEIGHT = 20
 const CTRL_F = "\x06"
 const CTRL_Q = "\x11"
 
@@ -72,11 +74,8 @@ function matchesFilter(issue: BdIssue, term: string): boolean {
   )
 }
 
-function isPrintable(data: string): boolean {
-  return data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) < 127
-}
-
 const CYCLE_STATUSES: IssueStatus[] = ["open", "in_progress", "closed"]
+const CYCLE_TYPES = ["task", "feature", "bug", "chore", "epic"] as const
 
 function cycleStatus(current: IssueStatus): IssueStatus {
   const idx = CYCLE_STATUSES.indexOf(current)
@@ -84,7 +83,15 @@ function cycleStatus(current: IssueStatus): IssueStatus {
   return CYCLE_STATUSES[(idx + 1) % CYCLE_STATUSES.length]
 }
 
+function cycleIssueType(current: string | undefined): string {
+  const normalized = current || "task"
+  const idx = CYCLE_TYPES.indexOf(normalized as (typeof CYCLE_TYPES)[number])
+  if (idx === -1) return CYCLE_TYPES[0]
+  return CYCLE_TYPES[(idx + 1) % CYCLE_TYPES.length]
+}
+
 export default function beadsTasks(pi: ExtensionAPI) {
+
   async function execBd(args: string[], timeout = 30_000): Promise<string> {
     const result = await pi.exec("bd", args, { timeout })
     if (result.code !== 0) {
@@ -154,7 +161,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         continue
       }
 
-      const maxLabelWidth = Math.max(...displayIssues.map(i =>
+      const getMaxLabelWidth = () => Math.max(...displayIssues.map(i =>
         stripAnsi(buildIssueListRowModel(i).label).length
       ))
 
@@ -165,10 +172,18 @@ export default function beadsTasks(pi: ExtensionAPI) {
         let searchBuffer = ""
         let descScroll = 0
 
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
+        const headerContainer = new Container()
+        const listAreaContainer = new Container()
+        const footerContainer = new Container()
+        const paddedListAreaContainer = new MinHeightContainer(listAreaContainer, LIST_PAGE_CONTENT_MIN_HEIGHT)
+
+        container.addChild(headerContainer)
+        container.addChild(paddedListAreaContainer)
+        container.addChild(footerContainer)
 
         const titleText = new Text("", 1, 0)
-        container.addChild(titleText)
+
+        const META_SUMMARY_SEPARATOR = " "
 
         const accentMarker = "__ACCENT_MARKER__"
         const accentedMarker = theme.fg("accent", accentMarker)
@@ -176,7 +191,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         const accentPrefix = markerIndex >= 0 ? accentedMarker.slice(0, markerIndex) : ""
         const accentSuffix = markerIndex >= 0 ? accentedMarker.slice(markerIndex + accentMarker.length) : "\x1b[0m"
         const applyAccentWithAnsi = (text: string) => {
-          const normalized = text.replaceAll(DESCRIPTION_PART_SEPARATOR, " • ")
+          const normalized = text.replaceAll(DESCRIPTION_PART_SEPARATOR, META_SUMMARY_SEPARATOR)
           if (!accentPrefix) return theme.fg("accent", normalized)
           return `${accentPrefix}${normalized.replace(/\x1b\[0m/g, `\x1b[0m${accentPrefix}`)}${accentSuffix}`
         }
@@ -184,15 +199,16 @@ export default function beadsTasks(pi: ExtensionAPI) {
         const styleDescription = (text: string) => {
           const { meta, summary } = decodeIssueDescription(text)
           if (!summary) return theme.fg("muted", meta)
-          return `${theme.fg("muted", meta)} • ${summary}`
+          return `${theme.fg("muted", meta)}${META_SUMMARY_SEPARATOR}${summary}`
         }
 
         const getItems = () => {
           const filtered = filterTerm
             ? displayIssues.filter(i => matchesFilter(i, filterTerm))
             : displayIssues
+          const maxLabelWidth = getMaxLabelWidth()
           return filtered.map((issue) => {
-            const row = buildIssueListRowModel(issue, maxLabelWidth)
+            const row = buildIssueListRowModel(issue, { maxLabelWidth })
             return {
               value: row.id,
               label: row.label,
@@ -243,7 +259,14 @@ export default function beadsTasks(pi: ExtensionAPI) {
             done("cancel")
           }
         }
-        container.addChild(selectList)
+        const renderListArea = () => {
+          while (listAreaContainer.children.length > 0) {
+            listAreaContainer.removeChild(listAreaContainer.children[0])
+          }
+          listAreaContainer.addChild(selectList)
+          listAreaContainer.addChild(new Spacer(1))
+          listAreaContainer.addChild(itemPreviewContainer)
+        }
 
         const wrapText = (text: string, width: number, maxLines: number): string[] => {
           const lines: string[] = []
@@ -299,42 +322,56 @@ export default function beadsTasks(pi: ExtensionAPI) {
           return wrappedLines.join("\n")
         }
 
+        const previewTitleText = new Text("", 0, 0)
         const descTextComponent = new Text(buildDescText([], 80), 0, 0)
-        container.addChild(new Spacer(1))
-        container.addChild(descTextComponent)
+        const itemPreviewContainer = new Container()
+        itemPreviewContainer.addChild(previewTitleText)
+        itemPreviewContainer.addChild(descTextComponent)
 
         let lastWidth = 80
 
         const updateDescPreview = () => {
           const selected = selectList.getSelectedItem()
-          if (selected) {
-            descScroll = 0
-            const issue = displayIssues.find(i => i.id === selected.value)
-            if (issue) {
-              const descLines = truncateDescription(issue.description, 100)
-              descTextComponent.setText(buildDescText(descLines, lastWidth))
-            }
+          if (!selected) {
+            previewTitleText.setText("")
+            descTextComponent.setText(buildDescText([], lastWidth))
+            return
           }
+
+          descScroll = 0
+          const issue = displayIssues.find(i => i.id === selected.value)
+          if (!issue) {
+            previewTitleText.setText("")
+            descTextComponent.setText(buildDescText([], lastWidth))
+            return
+          }
+
+          previewTitleText.setText(theme.fg("accent", theme.bold(issue.title)))
+          const descLines = truncateDescription(issue.description, 100)
+          descTextComponent.setText(buildDescText(descLines, lastWidth))
         }
         if (items[0]) updateDescPreview()
 
-        container.addChild(new DynamicBorder((s: string) => theme.fg("muted", s)))
+        headerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
+        headerContainer.addChild(titleText)
 
-        const helpText = new Text("", 1, 0)
-        container.addChild(helpText)
+        const helpText = new Text("", KEYBOARD_HELP_PADDING_X, 0)
+        const shortcutsText = new Text(theme.fg("dim", buildListSecondaryHelpText()), KEYBOARD_HELP_PADDING_X, 0)
 
-        const shortcutsText = new Text(theme.fg("dim", buildListSecondaryHelpText()), 1, 0)
-        container.addChild(shortcutsText)
+        footerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
+        footerContainer.addChild(helpText)
+        footerContainer.addChild(shortcutsText)
+        footerContainer.addChild(new DynamicBorder((s: string) => theme.fg("dim", s)))
 
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
+        renderListArea()
 
         const refreshDisplay = () => {
           if (searching) {
-            titleText.setText(theme.fg("accent", theme.bold(`Search: ${searchBuffer}_`)))
+            titleText.setText(theme.fg("muted", theme.bold(`Search: ${searchBuffer}_`)))
           } else if (filterTerm) {
-            titleText.setText(theme.fg("accent", theme.bold(`${title} [filter: ${filterTerm}]`)))
+            titleText.setText(theme.fg("muted", theme.bold(`${title} [filter: ${filterTerm}]`)))
           } else {
-            titleText.setText(theme.fg("accent", theme.bold(title)))
+            titleText.setText(theme.fg("muted", theme.bold(title)))
           }
           helpText.setText(theme.fg("dim", buildListPrimaryHelpText({
             searching,
@@ -366,15 +403,10 @@ export default function beadsTasks(pi: ExtensionAPI) {
           return displayIssues.find(i => i.id === selected.value)
         }
 
-        // Re-render helper - rebuild entire container to maintain component order
+        // Re-render helper - rebuild list area while preserving page sections.
         const rebuildAndRender = () => {
           items = getItems()
           const prevSelected = selectList.getSelectedItem()
-
-          // Clear and rebuild container
-          while (container.children && container.children.length > 0) {
-            container.removeChild(container.children[0])
-          }
 
           // Recreate SelectList
           selectList = new SelectList(items, Math.min(items.length, 10), {
@@ -408,16 +440,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
             }
           }
 
-          // Rebuild container in exact same order
-          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
-          container.addChild(titleText)
-          container.addChild(selectList)
-          container.addChild(new Spacer(1))
-          container.addChild(descTextComponent)
-          container.addChild(new DynamicBorder((s: string) => theme.fg("muted", s)))
-          container.addChild(helpText)
-          container.addChild(shortcutsText)
-          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)))
+          renderListArea()
 
           // Restore selection
           if (prevSelected) {
@@ -556,6 +579,26 @@ export default function beadsTasks(pi: ExtensionAPI) {
                 return
               }
 
+              case "toggleType": {
+                const issue = getSelectedIssue()
+                if (issue) {
+                  const newType = cycleIssueType(issue.issue_type)
+                  issue.issue_type = newType
+                  updateIssue(issue.id, ["--type", newType])
+                  rebuildAndRender()
+                }
+                return
+              }
+
+              case "reference": {
+                const issue = getSelectedIssue()
+                if (issue) {
+                  done("cancel")
+                  ctx.ui.pasteToEditor(`${serializeIssueReference(issue)} `)
+                }
+                return
+              }
+
               case "delegate":
                 selectList.handleInput(data)
                 tui.requestRender()
@@ -569,233 +612,99 @@ export default function beadsTasks(pi: ExtensionAPI) {
       if (result === "select" && selectedId) {
         rememberedSelectedId = selectedId
         const currentIssue = displayIssues.find(i => i.id === selectedId)
-        const updated = await editIssue(ctx, selectedId, currentIssue)
-        if (updated) {
+        const editResult = await editIssue(ctx, selectedId, currentIssue)
+        if (editResult.updatedIssue) {
           const idx = displayIssues.findIndex(i => i.id === selectedId)
           if (idx !== -1) {
-            displayIssues[idx] = updated
+            displayIssues[idx] = editResult.updatedIssue
           }
         }
+        if (editResult.closeList) return
         continue
       }
     }
   }
 
-  // Issue form editor with inline editable fields
-  async function editIssue(ctx: ExtensionCommandContext, id: string, fromList?: BdIssue): Promise<BdIssue | null> {
+  interface EditIssueResult {
+    updatedIssue: BdIssue | null
+    closeList: boolean
+  }
+
+  function buildIssueUpdateArgs(previous: BdIssue, next: {
+    title: string
+    description: string
+    status: IssueStatus
+    priority: number | undefined
+    issueType: string | undefined
+  }): string[] {
+    const args: string[] = []
+
+    const nextTitle = next.title.trim()
+    if (nextTitle !== previous.title.trim()) {
+      args.push("--title", nextTitle)
+    }
+
+    if (next.description !== (previous.description ?? "")) {
+      args.push("--description", next.description)
+    }
+
+    if (next.status !== previous.status) {
+      args.push("--status", next.status)
+    }
+
+    if (next.priority !== previous.priority) {
+      args.push("--priority", String(next.priority))
+    }
+
+    if (next.issueType !== previous.issue_type) {
+      args.push("--type", next.issueType || "task")
+    }
+
+    return args
+  }
+
+  // Issue show view with inline save behavior.
+  async function editIssue(ctx: ExtensionCommandContext, id: string, fromList?: BdIssue): Promise<EditIssueResult> {
     let issue = await getIssueForEdit(id, fromList)
 
-    while (true) {
-      let titleValue = issue.title
-      let descValue = issue.description ?? ""
-      let statusValue = issue.status
-      let priorityValue = issue.priority
-      let focused: EditFocus = "nav"
-      let titleCursor = issue.title.length
-      let descCursor = (issue.description ?? "").length
+    const formResult = await showIssueForm(ctx, {
+      issue,
+      ctrlQ: CTRL_Q,
+      cycleStatus,
+      cycleIssueType,
+      parsePriorityKey,
+      onSave: async (draft) => {
+        const updateArgs = buildIssueUpdateArgs(issue, {
+          title: draft.title,
+          description: draft.description,
+          status: draft.status,
+          priority: draft.priority,
+          issueType: draft.issueType,
+        })
 
-      const result = await ctx.ui.custom<boolean>((tui: any, theme: any, _kb: any, done: any) => {
-        return {
-          render: (w: number) => {
-            const lines: string[] = []
-            lines.push("─".repeat(Math.min(50, w)))
-            const headerText = buildIssueEditHeader(issue.id, priorityValue, statusValue)
-            lines.push(truncateToWidth(headerText, w))
-            lines.push("")
-            lines.push(focused === "title" ? "▸ Title:" : "  Title:")
-            if (focused === "title") {
-              const before = titleValue.slice(0, titleCursor)
-              const after = titleValue.slice(titleCursor)
-              lines.push(truncateToWidth(`   ${before}${CURSOR_MARKER}${after}`, w))
-            } else {
-              lines.push(truncateToWidth(`   ${titleValue}`, w))
-            }
-            lines.push("")
-            lines.push(focused === "desc" ? "▸ Description:" : "  Description:")
-            const descLines = descValue.split("\n")
-            let cursorLineIdx = 0
-            let cursorCol = 0
-            let charsConsumed = 0
-            for (let i = 0; i < descLines.length; i++) {
-              if (charsConsumed + descLines[i].length >= descCursor) {
-                cursorLineIdx = i
-                cursorCol = descCursor - charsConsumed
-                break
-              }
-              charsConsumed += descLines[i].length + 1
-            }
-            const startLine = Math.max(0, cursorLineIdx - 2)
-            const endLine = Math.min(descLines.length, startLine + 5)
-            for (let i = startLine; i < endLine; i++) {
-              const line = descLines[i]
-              if (focused === "desc" && i === cursorLineIdx) {
-                const before = line.slice(0, cursorCol)
-                const after = line.slice(cursorCol)
-                lines.push(truncateToWidth(`   ${before}${CURSOR_MARKER}${after}`, w))
-              } else {
-                lines.push(truncateToWidth(`   ${line}`, w))
-              }
-            }
-            lines.push("")
-            lines.push(truncateToWidth(EDIT_HELP_TEXT[focused], w))
-            lines.push("─".repeat(Math.min(50, w)))
-            return lines
-          },
-          invalidate: () => {},
-          handleInput: (data: string) => {
-            if (matchesKey(data, Key.tab)) {
-              focused = focused === "nav" ? "title" : focused === "title" ? "desc" : "nav"
-              tui.requestRender()
-              return
-            }
-            if (matchesKey(data, Key.escape) || data === "q" || data === "Q") {
-              done(false)
-              return
-            }
-            if (matchesKey(data, Key.ctrl("c"))) {
-              done(false)
-              return
-            }
-            if (matchesKey(data, Key.enter)) {
-              if (focused !== "nav") {
-                focused = "nav"
-                done(true)
-                return
-              }
-              tui.requestRender()
-              return
-            }
-            if (focused === "nav") {
-              if (matchesKey(data, Key.space)) {
-                statusValue = cycleStatus(statusValue)
-                tui.requestRender()
-                return
-              }
-              const p = parsePriorityKey(data)
-              if (p !== null) {
-                priorityValue = p
-                tui.requestRender()
-                return
-              }
-              return
-            }
-            if (focused === "title") {
-              if (matchesKey(data, Key.backspace) && titleCursor > 0) {
-                titleValue = titleValue.slice(0, titleCursor - 1) + titleValue.slice(titleCursor)
-                titleCursor--
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.left) && titleCursor > 0) {
-                titleCursor--
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.right) && titleCursor < titleValue.length) {
-                titleCursor++
-                tui.requestRender()
-                return
-              }
-              if (isPrintable(data)) {
-                titleValue = titleValue.slice(0, titleCursor) + data + titleValue.slice(titleCursor)
-                titleCursor++
-                tui.requestRender()
-                return
-              }
-              return
-            }
-            if (focused === "desc") {
-              if (matchesKey(data, Key.backspace) && descCursor > 0) {
-                descValue = descValue.slice(0, descCursor - 1) + descValue.slice(descCursor)
-                descCursor--
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.left) && descCursor > 0) {
-                descCursor--
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.right) && descCursor < descValue.length) {
-                descCursor++
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.up)) {
-                let lineStart = descCursor
-                while (lineStart > 0 && descValue[lineStart - 1] !== "\n") lineStart--
-                if (lineStart > 0) {
-                  let prevLineStart = lineStart - 1
-                  while (prevLineStart > 0 && descValue[prevLineStart - 1] !== "\n") prevLineStart--
-                  const colInLine = descCursor - lineStart
-                  const prevLineLen = lineStart - 1 - prevLineStart
-                  descCursor = prevLineStart + Math.min(colInLine, prevLineLen)
-                }
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.down)) {
-                let lineStart = descCursor
-                while (lineStart > 0 && descValue[lineStart - 1] !== "\n") lineStart--
-                const colInLine = descCursor - lineStart
-                let nextLineStart = lineStart
-                while (nextLineStart < descValue.length && descValue[nextLineStart] !== "\n") nextLineStart++
-                nextLineStart++
-                if (nextLineStart < descValue.length) {
-                  let nextLineEnd = nextLineStart
-                  while (nextLineEnd < descValue.length && descValue[nextLineEnd] !== "\n") nextLineEnd++
-                  const nextLineLen = nextLineEnd - nextLineStart
-                  descCursor = nextLineStart + Math.min(colInLine, nextLineLen)
-                }
-                tui.requestRender()
-                return
-              }
-              if (matchesKey(data, Key.enter)) {
-                descValue = descValue.slice(0, descCursor) + "\n" + descValue.slice(descCursor)
-                descCursor++
-                tui.requestRender()
-                return
-              }
-              if (isPrintable(data)) {
-                descValue = descValue.slice(0, descCursor) + data + descValue.slice(descCursor)
-                descCursor++
-                tui.requestRender()
-                return
-              }
-            }
-          },
+        if (updateArgs.length === 0) return false
+
+        await updateIssue(id, updateArgs)
+        issue = {
+          ...issue,
+          title: draft.title.trim(),
+          description: draft.description,
+          status: draft.status,
+          priority: draft.priority,
+          issue_type: draft.issueType,
         }
-      })
+        return true
+      },
+    })
 
-      if (!result) return null
-
-      if (titleValue.trim() !== issue.title.trim()) {
-        await updateIssue(id, ["--title", titleValue.trim()])
-        ctx.ui.notify("Title updated", "success")
-        issue.title = titleValue.trim()
-      }
-      if (descValue !== (issue.description ?? "")) {
-        await updateIssue(id, ["--description", descValue])
-        ctx.ui.notify("Description updated", "success")
-        issue.description = descValue
-      }
-      if (statusValue !== issue.status) {
-        await updateIssue(id, ["--status", statusValue])
-        ctx.ui.notify(`Status: ${statusValue}`, "success")
-        issue.status = statusValue
-      }
-      if (priorityValue !== issue.priority) {
-        await updateIssue(id, ["--priority", String(priorityValue)])
-        ctx.ui.notify(`Priority: P${priorityValue}`, "success")
-        issue.priority = priorityValue
-      }
-
-      return issue
+    return {
+      updatedIssue: issue,
+      closeList: formResult.action === "close_list",
     }
   }
 
   async function browseIssues(ctx: ExtensionCommandContext, mode: ListMode): Promise<void> {
-    const modeTitle = mode === "ready" ? "Beads — Ready" : mode === "open" ? "Beads — Open" : "Beads — All"
+    const modeTitle = "Tasks"
 
     try {
       ctx.ui.setStatus("beads", "Loading…")

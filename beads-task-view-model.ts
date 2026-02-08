@@ -25,6 +25,17 @@ interface IssueListElements {
   summary?: string
 }
 
+export interface IssueListTextParts {
+  identity: string
+  title: string
+  meta: string
+  summary?: string
+}
+
+export interface IssueListRowOptions {
+  maxLabelWidth?: number
+}
+
 export interface IssueListRowModel {
   id: string
   label: string
@@ -40,6 +51,14 @@ const PRIORITY_COLORS: Record<number, string> = {
   4: "\x1b[38;5;245m", // gray
 }
 
+const STATUS_SYMBOLS: Record<IssueStatus, string> = {
+  open: "○",
+  in_progress: "◑",
+  blocked: "✖",
+  deferred: "⏸",
+  closed: "✓",
+}
+
 const MUTED_TEXT = "\x1b[38;5;245m"
 const ANSI_RESET = "\x1b[0m"
 export const DESCRIPTION_PART_SEPARATOR = "\u241F"
@@ -50,7 +69,7 @@ export const EDIT_HELP_TEXT: Record<EditFocus, string> = {
   nav: "tab nav | space status | 1-5 priority | esc/q/ctrl+c back",
 }
 
-function formatPriority(priority: number | undefined): string {
+export function formatIssuePriority(priority: number | undefined): string {
   if (priority === undefined || priority === null) return "P?"
   const color = PRIORITY_COLORS[priority] ?? ""
   return `${color}P${priority}${ANSI_RESET}`
@@ -59,6 +78,22 @@ function formatPriority(priority: number | undefined): string {
 function stripIdPrefix(id: string): string {
   const idx = id.indexOf("-")
   return idx >= 0 ? id.slice(idx + 1) : id
+}
+
+export function formatIssueStatusSymbol(status: IssueStatus): string {
+  return STATUS_SYMBOLS[status] ?? "?"
+}
+
+export function formatIssueStatusLabel(status: IssueStatus): string {
+  return status.replaceAll("_", " ")
+}
+
+export function formatIssueStatusWithLabel(status: IssueStatus): string {
+  return `${formatIssueStatusSymbol(status)} ${formatIssueStatusLabel(status)}`
+}
+
+export function formatIssueTypeLabel(issueType: string | undefined): string {
+  return issueType || "issue"
 }
 
 function firstLine(text: string | undefined): string | undefined {
@@ -73,12 +108,24 @@ export function stripAnsi(str: string): string {
 
 function buildIssueListElements(issue: BdIssue): IssueListElements {
   return {
-    priority: formatPriority(issue.priority),
+    priority: formatIssuePriority(issue.priority),
     id: stripIdPrefix(issue.id),
     title: issue.title,
-    status: issue.status.slice(0, 4).padEnd(4),
+    status: formatIssueStatusSymbol(issue.status),
     type: (issue.issue_type || "issue").slice(0, 4).padEnd(4),
     summary: firstLine(issue.description),
+  }
+}
+
+export function buildIssueListTextParts(issue: BdIssue): IssueListTextParts {
+  const elements = buildIssueListElements(issue)
+  const mutedId = `${MUTED_TEXT}${elements.id}${ANSI_RESET}`
+
+  return {
+    identity: `${elements.priority} ${mutedId}`,
+    title: elements.title,
+    meta: `${elements.status} ${elements.type}`,
+    summary: elements.summary,
   }
 }
 
@@ -91,25 +138,41 @@ export function decodeIssueDescription(text: string): { meta: string; summary?: 
   return { meta: meta || "", summary }
 }
 
-export function buildIssueListRowModel(issue: BdIssue, maxLabelWidth?: number): IssueListRowModel {
-  const elements = buildIssueListElements(issue)
-  const mutedId = `${MUTED_TEXT}${elements.id}${ANSI_RESET}`
-  const baseLabel = `${elements.priority} ${mutedId} ${elements.title}`
+export function buildIssueListRowModel(issue: BdIssue, options: IssueListRowOptions = {}): IssueListRowModel {
+  const { maxLabelWidth } = options
+  const parts = buildIssueListTextParts(issue)
+  const baseLabel = `${parts.identity} ${parts.title}`
   const visibleWidth = stripAnsi(baseLabel).length
   const label = maxLabelWidth !== undefined && visibleWidth < maxLabelWidth
     ? baseLabel + " ".repeat(maxLabelWidth - visibleWidth)
     : baseLabel
 
-  const meta = `${elements.status} • ${elements.type}`
   return {
     id: issue.id,
     label,
-    description: encodeIssueDescription(meta, elements.summary),
+    description: encodeIssueDescription(parts.meta, parts.summary),
   }
 }
 
 export function buildIssueEditHeader(issueId: string, priority: number | undefined, status: IssueStatus): string {
-  return `${formatPriority(priority)} ${stripIdPrefix(issueId)} [${status}]`
+  return `${formatIssuePriority(priority)} ${stripIdPrefix(issueId)} [${status}]`
+}
+
+export function serializeIssueReference(issue: BdIssue): string {
+  const parts = [
+    `id=${issue.id}`,
+    `title="${issue.title}"`,
+    `status=${issue.status}`,
+    `priority=${issue.priority ?? "unknown"}`,
+    `type=${issue.issue_type || "issue"}`,
+  ]
+
+  const description = issue.description?.trim()
+  if (description) {
+    parts.push(`description="${description.replaceAll("\n", "\\n")}"`)
+  }
+
+  return `beads_task(${parts.join(", ")})`
 }
 
 export function buildWorkPrompt(issue: BdIssue): string {

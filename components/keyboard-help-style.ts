@@ -1,0 +1,1 @@
+export const KEYBOARD_HELP_PADDING_X = 1

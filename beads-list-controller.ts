@@ -13,6 +13,8 @@ export type ListIntent =
   | { type: "toggleStatus" }
   | { type: "setPriority"; priority: number }
   | { type: "scrollDescription"; delta: number }
+  | { type: "toggleType" }
+  | { type: "reference" }
   | { type: "delegate" }
 
 export interface ListControllerState {
@@ -75,7 +77,7 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
   {
     context: "default",
-    help: "↑↓/w/s navigate",
+    help: "w/s navigate",
     match: (data) => data === "w" || data === "W" || data === "s" || data === "S",
     intent: (data) => ({ type: "moveSelection", delta: data === "w" || data === "W" ? -1 : 1 }),
   },
@@ -88,7 +90,7 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   {
     context: "default",
     help: "e edit",
-    match: (data) => data === "e" || data === "E",
+    match: (data) => data === "e" || data === "E" || matchesKey(data, Key.right),
     intent: () => ({ type: "edit" }),
   },
   {
@@ -100,9 +102,9 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
   {
     context: "default",
-    help: "ctrl+f search",
+    help: "f find",
     showInHelp: (state) => state.allowSearch,
-    match: (data, state) => state.allowSearch && data === state.ctrlF,
+    match: (data, state) => state.allowSearch && (data === "f" || data === "F"),
     intent: () => ({ type: "searchStart" }),
   },
   {
@@ -114,6 +116,18 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     context: "default",
     match: (data) => data === "j" || data === "k",
     intent: (data) => ({ type: "scrollDescription", delta: data === "j" ? 1 : -1 }),
+  },
+  {
+    context: "default",
+    help: "t type",
+    match: (data) => data === "t" || data === "T",
+    intent: () => ({ type: "toggleType" }),
+  },
+  {
+    context: "default",
+    help: "tab reference",
+    match: (data) => matchesKey(data, Key.tab),
+    intent: () => ({ type: "reference" }),
   },
   {
     context: "default",

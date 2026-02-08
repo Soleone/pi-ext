@@ -47,6 +47,18 @@ function isPrintable(data: string): boolean {
   return data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) < 127
 }
 
+const MOVE_KEYS: Record<string, number> = {
+  w: -1,
+  W: -1,
+  s: 1,
+  S: 1,
+}
+
+const SCROLL_KEYS: Record<string, number> = {
+  j: 1,
+  k: -1,
+}
+
 const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   {
     context: "search",
@@ -79,8 +91,8 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   {
     context: "default",
     help: "w/s navigate",
-    match: (data) => data === "w" || data === "W" || data === "s" || data === "S",
-    intent: (data) => ({ type: "moveSelection", delta: data === "w" || data === "W" ? -1 : 1 }),
+    match: (data) => data in MOVE_KEYS,
+    intent: (data) => ({ type: "moveSelection", delta: MOVE_KEYS[data] ?? 1 }),
   },
   {
     context: "default",
@@ -115,8 +127,8 @@ const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
   {
     context: "default",
-    match: (data) => data === "j" || data === "k",
-    intent: (data) => ({ type: "scrollDescription", delta: data === "j" ? 1 : -1 }),
+    match: (data) => data in SCROLL_KEYS,
+    intent: (data) => ({ type: "scrollDescription", delta: SCROLL_KEYS[data] ?? 1 }),
   },
   {
     context: "default",

@@ -59,6 +59,59 @@ interface ShowIssueFormOptions {
   onSave: (draft: IssueFormDraft) => Promise<boolean>
 }
 
+type HeaderStatusColor = "dim" | "accent" | "warning"
+
+interface HeaderStatusViewModel {
+  message: string
+  icon?: string
+  color: HeaderStatusColor
+}
+
+const FOCUS_LABELS: Record<Exclude<IssueFormFocus, "nav">, string> = {
+  title: "Title",
+  desc: "Description",
+}
+
+function getHeaderStatus(
+  saveIndicator: "saving" | "saved" | "error" | undefined,
+  focus: IssueFormFocus,
+): HeaderStatusViewModel | undefined {
+  if (saveIndicator === "saving") return { message: "Saving…", icon: "⟳", color: "dim" }
+  if (saveIndicator === "saved") return { message: "Saved", icon: "✓", color: "accent" }
+  if (saveIndicator === "error") return { message: "Save failed", color: "warning" }
+  if (focus === "title" || focus === "desc") return { message: `Editing ${FOCUS_LABELS[focus].toLowerCase()}`, color: "accent" }
+  return undefined
+}
+
+function buildPageTitle(theme: any, subtitle: string, status?: HeaderStatusViewModel): string {
+  const base = `${theme.fg("muted", theme.bold("Tasks"))}${theme.fg("dim", ` • ${subtitle}`)}`
+  if (!status) return base
+
+  const marker = status.icon ? theme.fg(status.color, status.icon) : "•"
+  return `${base} ${marker} ${theme.fg(status.color, status.message)}`
+}
+
+function buildSelectedTaskLine(
+  mode: TaskFormMode,
+  theme: any,
+  rowIdentity: string,
+  rowMeta: string,
+  priority: number | undefined,
+  issueType: string | undefined,
+): string {
+  if (mode === "create") {
+    const identity = buildIssueIdentityText(priority, "new")
+    return `${theme.fg("accent", SELECTED_ITEM_PREFIX)}${identity} ${formatIssueTypeCode(issueType)}`
+  }
+
+  return `${theme.fg("accent", SELECTED_ITEM_PREFIX)}${rowIdentity} ${rowMeta}`
+}
+
+function fieldLabel(theme: any, label: string, focused: boolean): string {
+  const color = focused ? "accent" : "muted"
+  return theme.fg(color, theme.bold(`  ${label}`))
+}
+
 function buildPrimaryHelpText(focus: IssueFormFocus): string {
   if (focus === "title") return "enter save • tab description • esc back"
   if (focus === "desc") return "enter newline • tab save • esc back"
@@ -283,44 +336,14 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
         priority: priorityValue,
         issue_type: issueTypeValue,
       })
-      const headerStatus = saveIndicator === "saving"
-        ? { message: "Saving…", icon: "⟳", color: "dim" as const }
-        : saveIndicator === "saved"
-          ? { message: "Saved", icon: "✓", color: "accent" as const }
-          : saveIndicator === "error"
-            ? { message: "Save failed", icon: undefined as string | undefined, color: "warning" as const }
-            : focus === "title"
-              ? { message: "Editing title", icon: undefined as string | undefined, color: "accent" as const }
-              : focus === "desc"
-                ? { message: "Editing description", icon: undefined as string | undefined, color: "accent" as const }
-                : undefined
 
-      const pageTitle = `${theme.fg("muted", theme.bold("Tasks"))}${theme.fg("dim", ` • ${subtitle}`)}`
-      if (!headerStatus) {
-        pageTitleText.setText(pageTitle)
-      } else {
-        const marker = headerStatus.icon ? theme.fg(headerStatus.color, headerStatus.icon) : "•"
-        const statusText = theme.fg(headerStatus.color, headerStatus.message)
-        pageTitleText.setText(`${pageTitle} ${marker} ${statusText}`)
-      }
-
-      if (mode === "create") {
-        const identity = buildIssueIdentityText(priorityValue, "new")
-        const typeCode = formatIssueTypeCode(issueTypeValue)
-        selectedTaskText.setText(`${theme.fg("accent", SELECTED_ITEM_PREFIX)}${identity} ${typeCode}`)
-      } else {
-        selectedTaskText.setText(`${theme.fg("accent", SELECTED_ITEM_PREFIX)}${rowParts.identity} ${rowParts.meta}`)
-      }
-      titleLabel.setText(
-        focus === "title"
-          ? theme.fg("accent", theme.bold("  Title"))
-          : theme.fg("muted", theme.bold("  Title")),
+      const headerStatus = getHeaderStatus(saveIndicator, focus)
+      pageTitleText.setText(buildPageTitle(theme, subtitle, headerStatus))
+      selectedTaskText.setText(
+        buildSelectedTaskLine(mode, theme, rowParts.identity, rowParts.meta, priorityValue, issueTypeValue),
       )
-      descLabel.setText(
-        focus === "desc"
-          ? theme.fg("accent", theme.bold("  Description"))
-          : theme.fg("muted", theme.bold("  Description")),
-      )
+      titleLabel.setText(fieldLabel(theme, "Title", focus === "title"))
+      descLabel.setText(fieldLabel(theme, "Description", focus === "desc"))
 
       helpText.setText(formatKeyboardHelp(theme, buildPrimaryHelpText(focus)))
       const secondaryHelp = buildSecondaryHelpText(focus)
@@ -348,6 +371,83 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
 
     renderLayout()
 
+    const requestRender = () => {
+      container.invalidate()
+      tui.requestRender()
+    }
+
+    const handleTitleInput = (data: string) => {
+      if (matchesKey(data, Key.enter)) {
+        focus = "nav"
+        void triggerSave()
+        renderLayout()
+        return
+      }
+
+      if (matchesKey(data, Key.tab)) {
+        focus = "desc"
+        renderLayout()
+        return
+      }
+
+      titleEditor.handleInput(data)
+      requestRender()
+    }
+
+    const handleDescInput = (data: string) => {
+      if (matchesKey(data, Key.enter)) {
+        descEditor.insertTextAtCursor("\n")
+        requestRender()
+        return
+      }
+
+      if (matchesKey(data, Key.tab)) {
+        focus = "nav"
+        void triggerSave()
+        renderLayout()
+        return
+      }
+
+      descEditor.handleInput(data)
+      requestRender()
+    }
+
+    const handleNavInput = (data: string) => {
+      if (matchesKey(data, Key.enter)) {
+        void triggerSave()
+        return
+      }
+
+      if (matchesKey(data, Key.tab)) {
+        focus = "title"
+        renderLayout()
+        return
+      }
+
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.left) || data === "q" || data === "Q") {
+        done({ action: "back" })
+        return
+      }
+
+      if (data === "t" || data === "T") {
+        issueTypeValue = cycleIssueType(issueTypeValue)
+        renderLayout()
+        return
+      }
+
+      if (data === " ") {
+        statusValue = cycleStatus(statusValue)
+        renderLayout()
+        return
+      }
+
+      const priority = parsePriorityKey(data)
+      if (priority !== null) {
+        priorityValue = priority
+        renderLayout()
+      }
+    }
+
     return {
       render: (w: number) => container.render(w).map((line: string) => truncateToWidth(line, w)),
       invalidate: () => container.invalidate(),
@@ -368,81 +468,16 @@ export async function showIssueForm(ctx: ExtensionCommandContext, options: ShowI
         }
 
         if (focus === "title") {
-          if (matchesKey(data, Key.enter)) {
-            focus = "nav"
-            void triggerSave()
-            renderLayout()
-            return
-          }
-
-          if (matchesKey(data, Key.tab)) {
-            focus = "desc"
-            renderLayout()
-            return
-          }
-
-          titleEditor.handleInput(data)
-          container.invalidate()
-          tui.requestRender()
+          handleTitleInput(data)
           return
         }
 
         if (focus === "desc") {
-          if (matchesKey(data, Key.enter)) {
-            descEditor.insertTextAtCursor("\n")
-            container.invalidate()
-            tui.requestRender()
-            return
-          }
-
-          if (matchesKey(data, Key.tab)) {
-            focus = "nav"
-            void triggerSave()
-            renderLayout()
-            return
-          }
-
-          descEditor.handleInput(data)
-          container.invalidate()
-          tui.requestRender()
+          handleDescInput(data)
           return
         }
 
-        if (focus === "nav") {
-          if (matchesKey(data, Key.enter)) {
-            void triggerSave()
-            return
-          }
-
-          if (matchesKey(data, Key.tab)) {
-            focus = "title"
-            renderLayout()
-            return
-          }
-
-          if (matchesKey(data, Key.escape) || matchesKey(data, Key.left) || data === "q" || data === "Q") {
-            done({ action: "back" })
-            return
-          }
-
-          if (data === "t" || data === "T") {
-            issueTypeValue = cycleIssueType(issueTypeValue)
-            renderLayout()
-            return
-          }
-
-          if (data === " ") {
-            statusValue = cycleStatus(statusValue)
-            renderLayout()
-            return
-          }
-
-          const priority = parsePriorityKey(data)
-          if (priority !== null) {
-            priorityValue = priority
-            renderLayout()
-          }
-        }
+        handleNavInput(data)
       },
     }
   })

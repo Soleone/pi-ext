@@ -36,6 +36,24 @@ const LIST_PAGE_CONTENT_MIN_HEIGHT = 20
 const CTRL_F = "\x06"
 const CTRL_Q = "\x11"
 
+const MODE_SUBTITLES: Record<ListMode, string> = {
+  ready: "Ready",
+  open: "Open",
+  all: "All",
+}
+
+const LIST_MODE_ARGS: Record<ListMode, string[]> = {
+  ready: ["ready", "--limit", String(MAX_LIST_RESULTS), "--sort", "priority", "--json"],
+  open: ["list", "--sort", "priority", "--limit", String(MAX_LIST_RESULTS), "--json"],
+  all: ["list", "--all", "--sort", "priority", "--limit", String(MAX_LIST_RESULTS), "--json"],
+}
+
+const LIST_MODE_CONTEXT: Record<ListMode, string> = {
+  ready: "ready",
+  open: "list",
+  all: "list all",
+}
+
 function isLikelyIssueId(value: string): boolean {
   return /^[a-z0-9]+-[a-z0-9]+$/i.test(value)
 }
@@ -88,6 +106,30 @@ function matchesFilter(issue: BdIssue, term: string): boolean {
   )
 }
 
+function buildListHeaderText(
+  theme: any,
+  title: string,
+  subtitle: string | undefined,
+  searching: boolean,
+  searchBuffer: string,
+  filterTerm: string,
+): string {
+  if (searching) return theme.fg("muted", theme.bold(`Search: ${searchBuffer}_`))
+  if (filterTerm) return theme.fg("muted", theme.bold(`${title} [filter: ${filterTerm}]`))
+
+  const subtitlePart = subtitle ? theme.fg("dim", ` • ${subtitle}`) : ""
+  return `${theme.fg("muted", theme.bold(title))}${subtitlePart}`
+}
+
+const ARG_TO_LIST_MODE: Record<string, ListMode> = {
+  open: "open",
+  all: "all",
+}
+
+function parseListMode(args: string): ListMode {
+  return ARG_TO_LIST_MODE[args] || "ready"
+}
+
 const CYCLE_STATUSES: IssueStatus[] = ["open", "in_progress", "closed"]
 const CYCLE_TYPES = ["task", "feature", "bug", "chore", "epic"] as const
 
@@ -116,16 +158,8 @@ export default function beadsTasks(pi: ExtensionAPI) {
   }
 
   async function listIssues(mode: ListMode): Promise<BdIssue[]> {
-    if (mode === "ready") {
-      const out = await execBd(["ready", "--limit", String(MAX_LIST_RESULTS), "--sort", "priority", "--json"])
-      return parseJsonArray<BdIssue>(out, "ready")
-    }
-    if (mode === "open") {
-      const out = await execBd(["list", "--sort", "priority", "--limit", String(MAX_LIST_RESULTS), "--json"])
-      return parseJsonArray<BdIssue>(out, "list")
-    }
-    const out = await execBd(["list", "--all", "--sort", "priority", "--limit", String(MAX_LIST_RESULTS), "--json"])
-    return parseJsonArray<BdIssue>(out, "list all")
+    const out = await execBd(LIST_MODE_ARGS[mode])
+    return parseJsonArray<BdIssue>(out, LIST_MODE_CONTEXT[mode])
   }
 
   async function showIssue(id: string): Promise<BdIssue> {
@@ -380,14 +414,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         renderListArea()
 
         const refreshDisplay = () => {
-          if (searching) {
-            titleText.setText(theme.fg("muted", theme.bold(`Search: ${searchBuffer}_`)))
-          } else if (filterTerm) {
-            titleText.setText(theme.fg("muted", theme.bold(`${title} [filter: ${filterTerm}]`)))
-          } else {
-            const subtitlePart = subtitle ? theme.fg("dim", ` • ${subtitle}`) : ""
-            titleText.setText(`${theme.fg("muted", theme.bold(title))}${subtitlePart}`)
-          }
+          titleText.setText(buildListHeaderText(theme, title, subtitle, searching, searchBuffer, filterTerm))
           helpText.setText(formatKeyboardHelp(theme, buildListPrimaryHelpText({
             searching,
             filtered: !!filterTerm,
@@ -416,6 +443,12 @@ export default function beadsTasks(pi: ExtensionAPI) {
           if (!selected) return undefined
           rememberedSelectedId = selected.value
           return displayIssues.find(i => i.id === selected.value)
+        }
+
+        const withSelectedIssue = (run: (issue: BdIssue) => void): void => {
+          const issue = getSelectedIssue()
+          if (!issue) return
+          run(issue)
         }
 
         // Re-render helper - rebuild list area while preserving page sections.
@@ -531,48 +564,40 @@ export default function beadsTasks(pi: ExtensionAPI) {
                 moveSelection(intent.delta)
                 return
 
-              case "work": {
-                const issue = getSelectedIssue()
-                if (issue) {
+              case "work":
+                withSelectedIssue((issue) => {
                   done("cancel")
                   pi.sendUserMessage(buildWorkPrompt(issue))
-                }
+                })
                 return
-              }
 
-              case "edit": {
-                const issue = getSelectedIssue()
-                if (issue) {
+              case "edit":
+                withSelectedIssue((issue) => {
                   selectedId = issue.id
                   done("select")
-                }
+                })
                 return
-              }
 
-              case "toggleStatus": {
-                const issue = getSelectedIssue()
-                if (issue) {
+              case "toggleStatus":
+                withSelectedIssue((issue) => {
                   const newStatus = cycleStatus(issue.status)
                   issue.status = newStatus
                   updateIssue(issue.id, ["--status", newStatus])
                   rebuildAndRender()
-                }
+                })
                 return
-              }
 
-              case "setPriority": {
-                const issue = getSelectedIssue()
-                if (issue && issue.priority !== intent.priority) {
+              case "setPriority":
+                withSelectedIssue((issue) => {
+                  if (issue.priority === intent.priority) return
                   issue.priority = intent.priority
                   updateIssue(issue.id, ["--priority", String(intent.priority)])
                   rebuildAndRender()
-                }
+                })
                 return
-              }
 
-              case "scrollDescription": {
-                const issue = getSelectedIssue()
-                if (issue) {
+              case "scrollDescription":
+                withSelectedIssue((issue) => {
                   const descLines = truncateDescription(issue.description, 100)
                   const allWrapped: string[] = []
                   for (const line of descLines) {
@@ -590,33 +615,28 @@ export default function beadsTasks(pi: ExtensionAPI) {
                   descTextComponent.setText(visible.join("\n"))
                   container.invalidate()
                   tui.requestRender()
-                }
+                })
                 return
-              }
 
-              case "toggleType": {
-                const issue = getSelectedIssue()
-                if (issue) {
+              case "toggleType":
+                withSelectedIssue((issue) => {
                   const newType = cycleIssueType(issue.issue_type)
                   issue.issue_type = newType
                   updateIssue(issue.id, ["--type", newType])
                   rebuildAndRender()
-                }
+                })
                 return
-              }
 
               case "create":
                 done("create")
                 return
 
-              case "reference": {
-                const issue = getSelectedIssue()
-                if (issue) {
+              case "reference":
+                withSelectedIssue((issue) => {
                   done("cancel")
                   ctx.ui.pasteToEditor(`${serializeIssueReference(issue)} `)
-                }
+                })
                 return
-              }
 
               case "delegate":
                 selectList.handleInput(data)
@@ -816,7 +836,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
 
   async function browseIssues(ctx: ExtensionCommandContext, mode: ListMode): Promise<void> {
     const modeTitle = "Tasks"
-    const modeSubtitle = mode === "ready" ? "Ready" : mode === "open" ? "Open" : "All"
+    const modeSubtitle = MODE_SUBTITLES[mode]
 
     try {
       ctx.ui.setStatus("beads", "Loading…")
@@ -842,8 +862,7 @@ export default function beadsTasks(pi: ExtensionAPI) {
         }
         return
       }
-      const mode = args === "open" ? "open" : args === "all" ? "all" : "ready"
-      await browseIssues(ctx, mode)
+      await browseIssues(ctx, parseListMode(args))
     },
   })
 

@@ -151,9 +151,11 @@ export function buildIssueListRowModel(issue: BdIssue, options: IssueListRowOpti
   const parts = buildIssueListTextParts(issue)
   const baseLabel = `${parts.identity} ${parts.title}`
   const visibleWidth = stripAnsi(baseLabel).length
-  const label = maxLabelWidth !== undefined && visibleWidth < maxLabelWidth
-    ? baseLabel + " ".repeat(maxLabelWidth - visibleWidth)
-    : baseLabel
+
+  let label = baseLabel
+  if (maxLabelWidth !== undefined && visibleWidth < maxLabelWidth) {
+    label += " ".repeat(maxLabelWidth - visibleWidth)
+  }
 
   return {
     id: issue.id,

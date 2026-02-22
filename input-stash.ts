@@ -10,7 +10,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
   let stash: string | null = null;
 
-  pi.registerShortcut("ctrl+x", {
+  pi.registerShortcut("ctrl+,", {
     description: "Toggle stash: stash input when not blank, restore when blank",
     handler: async (ctx) => {
       const text = ctx.ui.getEditorText();

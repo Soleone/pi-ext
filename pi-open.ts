@@ -216,6 +216,11 @@ function getCommandArgs(command: string, filePath: string): string[] {
   return command === "glow" ? ["--pager", filePath] : [filePath]
 }
 
+function isTmuxAlive(): boolean {
+  const result = spawnSync("tmux", ["list-sessions"], { env: process.env, timeout: 2000 })
+  return result.status === 0
+}
+
 function runInTmuxPopup(commandName: string, filePath: string, cwd: string): number {
   const args = getCommandArgs(commandName, filePath).map(shellQuote).join(" ")
   const command = `${commandName} ${args}`
@@ -279,7 +284,8 @@ async function openTarget(
   }
 
   const commandName = commandOverride ?? pickCommand(absolutePath, settings)
-  const exitCode = process.env.TMUX
+  const useTmux = !!process.env.TMUX && isTmuxAlive()
+  const exitCode = useTmux
     ? runInTmuxPopup(commandName, absolutePath, ctx.cwd)
     : await runFullscreen(ctx, commandName, absolutePath)
 

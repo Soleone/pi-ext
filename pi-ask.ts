@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent"
-import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth } from "@mariozechner/pi-tui"
+import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui"
 import { Type } from "@sinclair/typebox"
 
 type Choice = {
@@ -16,7 +16,11 @@ type AskResult = {
   additionalText: string | null
   answer: string | null
   cancelled: boolean
+  freeformRequested: boolean
+  freeformChoices?: { label: string; description?: string }[]
 }
+
+const FREEFORM_LABEL = "Write a custom response"
 
 const ChoiceObjectSchema = Type.Object({
   label: Type.String({ description: "Visible option label" }),
@@ -61,7 +65,7 @@ function normalizeChoices(rawChoices: Array<string | { label: string; value?: st
 }
 
 function buildSystemPrompt(basePrompt: string): string {
-  return `${basePrompt}\n\n[pi-ask extension]\nRule: if you are about to ask the user to pick from 2+ choices, you MUST call ask_user instead of writing the choices in plain assistant text.\nThis includes "what should we do next?", tradeoff menus, option A/B/C prompts, and clarification checklists.\nKeep choices concise (3-6 options), and default allowAdditionalText=true so the user can press Tab on a selected option to add nuance.\nSelf-check before sending: if your draft contains a numbered/bulleted choice list for the user, replace it with ask_user.`
+  return `${basePrompt}\n\n[pi-ask extension]\nRule: if you are about to ask the user to pick from 2+ choices, you MUST call ask_user instead of writing the choices in plain assistant text.\nThis includes "what should we do next?", tradeoff menus, option A/B/C prompts, and clarification checklists.\nKeep choices concise (3-6 options), and default allowAdditionalText=true so the user can press Tab on a selected option to add nuance.\nFor each choice: label = the action/path (short, scannable), description = tradeoffs, pros/cons, or key context (optional, one line).\nSelf-check before sending: if your draft contains a numbered/bulleted choice list for the user, replace it with ask_user.`
 }
 
 function renderInlineCursor(text: string, cursor: number, focused: boolean): string {
@@ -71,6 +75,61 @@ function renderInlineCursor(text: string, cursor: number, focused: boolean): str
   const after = clampedCursor < text.length ? text.slice(clampedCursor + 1) : ""
   const marker = focused ? CURSOR_MARKER : ""
   return `${before}${marker}\x1b[7m${atCursor}\x1b[27m${after}`
+}
+
+/**
+ * Render a selected choice with its detail editing area.
+ * Detail text starts inline on the same line as the label.
+ * Overflow wraps with a hanging indent aligned to where the detail text began.
+ * Falls back to a separate line below the label if inline space is too narrow.
+ */
+function renderDetailBlock(
+  base: string,
+  separator: string,
+  text: string,
+  cursor: number,
+  focused: boolean,
+  fallbackIndent: string,
+  width: number,
+): string[] {
+  const cursorText = renderInlineCursor(text, cursor, focused)
+  const inlinePrefix = base + separator
+  const inlineAvail = width - visibleWidth(inlinePrefix)
+
+  // Try inline: detail starts on same line as label
+  if (inlineAvail >= 15) {
+    const wrapped = wrapTextWithAnsi(cursorText, inlineAvail)
+    if (wrapped.length === 0) {
+      return [inlinePrefix + renderInlineCursor("", 0, focused)]
+    }
+    const hangingIndent = " ".repeat(visibleWidth(inlinePrefix))
+    return wrapped.map((line, i) => (i === 0 ? inlinePrefix : hangingIndent) + line)
+  }
+
+  // Fallback: detail on separate line(s) below label
+  const fallbackAvail = width - visibleWidth(fallbackIndent)
+  if (fallbackAvail <= 5) {
+    return [truncateToWidth(base, width), fallbackIndent + renderInlineCursor(text, cursor, focused)]
+  }
+  const wrapped = wrapTextWithAnsi(cursorText, fallbackAvail)
+  if (wrapped.length === 0) {
+    return [truncateToWidth(base, width), fallbackIndent + renderInlineCursor("", 0, focused)]
+  }
+  return [truncateToWidth(base, width), ...wrapped.map(line => fallbackIndent + line)]
+}
+
+function makeResult(question: string, overrides: Partial<AskResult> = {}): AskResult {
+  return {
+    question,
+    selectedLabel: null,
+    selectedValue: null,
+    selectedIndex: null,
+    additionalText: null,
+    answer: null,
+    cancelled: false,
+    freeformRequested: false,
+    ...overrides,
+  }
 }
 
 function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
@@ -90,32 +149,19 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
       if (!ctx.hasUI) {
         return {
           content: [{ type: "text", text: "Error: ask_user requires interactive UI mode." }],
-          details: {
-            question: params.question,
-            selectedLabel: null,
-            selectedValue: null,
-            selectedIndex: null,
-            additionalText: null,
-            answer: null,
-            cancelled: true,
-          } satisfies AskResult,
+          details: makeResult(params.question, { cancelled: true }),
         }
       }
 
       if (choices.length === 0) {
         return {
           content: [{ type: "text", text: "Error: ask_user requires at least one choice." }],
-          details: {
-            question: params.question,
-            selectedLabel: null,
-            selectedValue: null,
-            selectedIndex: null,
-            additionalText: null,
-            answer: null,
-            cancelled: true,
-          } satisfies AskResult,
+          details: makeResult(params.question, { cancelled: true }),
         }
       }
+
+      const freeformIndex = choices.length
+      const totalItems = choices.length + 1
 
       const result = await ctx.ui.custom<AskResult>((tui, theme, _kb, done) => {
         let selectedIndex = 0
@@ -124,6 +170,8 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
         let focused = false
         let cachedLines: string[] | undefined
         const additionalByIndex = new Map<number, string>()
+
+        const isFreeform = () => selectedIndex === freeformIndex
 
         function getAdditional(index = selectedIndex): string {
           return additionalByIndex.get(index) || ""
@@ -139,39 +187,45 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
           tui.requestRender()
         }
 
-        function submitWithSelection(additionalText: string | null) {
+        function enterDetailMode() {
+          mode = "detail"
+          detailCursor = getAdditional().length
+          refresh()
+        }
+
+        function submitChoice(additionalText: string | null) {
           const selected = choices[selectedIndex]
           const normalizedAdditional = additionalText?.trim() || null
           const answer = normalizedAdditional ? `${selected.label}: ${normalizedAdditional}` : selected.label
 
-          done({
-            question: params.question,
+          done(makeResult(params.question, {
             selectedLabel: selected.label,
             selectedValue: selected.value,
             selectedIndex: selectedIndex + 1,
             additionalText: normalizedAdditional,
             answer,
-            cancelled: false,
-          })
+          }))
         }
 
-        function submitCancelled() {
-          done({
-            question: params.question,
-            selectedLabel: null,
-            selectedValue: null,
-            selectedIndex: null,
-            additionalText: null,
-            answer: null,
-            cancelled: true,
-          })
+        function submitFreeformRequest() {
+          done(makeResult(params.question, { freeformRequested: true }))
         }
 
         function handleDetailInput(data: string) {
           const current = getAdditional()
 
+          // Shift+Enter / Alt+Enter → insert newline
+          if (matchesKey(data, Key.shift("enter")) || matchesKey(data, Key.alt("enter"))) {
+            const next = current.slice(0, detailCursor) + "\n" + current.slice(detailCursor)
+            setAdditional(next)
+            detailCursor += 1
+            refresh()
+            return
+          }
+
+          // Plain Enter → submit
           if (matchesKey(data, Key.enter)) {
-            submitWithSelection(current)
+            submitChoice(current)
             return
           }
 
@@ -245,25 +299,47 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
           }
 
           if (matchesKey(data, Key.down)) {
-            selectedIndex = Math.min(choices.length - 1, selectedIndex + 1)
+            selectedIndex = Math.min(totalItems - 1, selectedIndex + 1)
             refresh()
             return
           }
 
-          if (allowAdditionalText && matchesKey(data, Key.tab)) {
-            mode = "detail"
-            detailCursor = getAdditional().length
-            refresh()
+          if (matchesKey(data, Key.tab)) {
+            if (isFreeform()) {
+              submitFreeformRequest()
+            } else if (allowAdditionalText) {
+              enterDetailMode()
+            }
             return
           }
 
           if (matchesKey(data, Key.enter)) {
-            submitWithSelection(getAdditional())
+            if (isFreeform()) {
+              submitFreeformRequest()
+            } else {
+              submitChoice(getAdditional())
+            }
             return
           }
 
-          if (canCancel && matchesKey(data, Key.escape)) {
-            submitCancelled()
+          if (matchesKey(data, Key.escape)) {
+            submitFreeformRequest()
+            return
+          }
+
+          // Number keys 1-9: quick-select and immediately submit a choice
+          if (data >= "1" && data <= "9") {
+            const index = parseInt(data) - 1
+            if (index < choices.length) {
+              selectedIndex = index
+              submitChoice(getAdditional(index))
+            }
+            return
+          }
+
+          // 0: freeform — close ask UI, return to native editor
+          if (data === "0") {
+            submitFreeformRequest()
           }
         }
 
@@ -272,11 +348,13 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
 
           const lines: string[] = []
           const add = (line: string) => lines.push(truncateToWidth(line, width))
+          const detailIndent = "     "
 
           add(theme.fg("accent", "─".repeat(width)))
           add(theme.fg("text", ` ${params.question}`))
           lines.push("")
 
+          // Render choices
           for (let i = 0; i < choices.length; i++) {
             const choice = choices[i]
             const isSelected = i === selectedIndex
@@ -286,8 +364,10 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
             const additional = getAdditional(i)
 
             if (isSelected && mode === "detail") {
-              const inline = renderInlineCursor(additional, detailCursor, focused)
-              add(`${base}${theme.fg("muted", " — ")}${inline}`)
+              const separator = theme.fg("muted", " — ")
+              for (const dl of renderDetailBlock(base, separator, additional, detailCursor, focused, detailIndent, width)) {
+                lines.push(dl)
+              }
             } else if (additional) {
               add(`${base}${theme.fg("muted", ` — ${additional}`)}`)
             } else {
@@ -295,21 +375,27 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
             }
 
             if (choice.description) {
-              add(`     ${theme.fg("muted", choice.description)}`)
+              add(`${detailIndent}${theme.fg("muted", choice.description)}`)
             }
           }
 
+          // Freeform option (always last)
           lines.push("")
-          if (mode === "detail") {
-            add(theme.fg("dim", ` Type inline ${additionalTextLabel} • Enter submit • Tab/Esc back`))
-          } else if (allowAdditionalText) {
-            add(theme.fg("dim", ` ↑↓ move • Enter select • Tab add inline ${additionalTextLabel}`))
-          } else {
-            add(theme.fg("dim", " ↑↓ move • Enter select"))
-          }
+          const freeformSelected = isFreeform()
+          const freeformPrefix = freeformSelected ? theme.fg("accent", "> ") : "  "
+          const freeformColor = freeformSelected ? "accent" : "muted"
+          add(`${freeformPrefix}${theme.fg(freeformColor, `0. ${FREEFORM_LABEL}`)}`)
 
-          if (canCancel && mode === "select") {
-            add(theme.fg("dim", " Esc cancel"))
+          // Help text
+          lines.push("")
+          const k = (key: string) => theme.fg("muted", key)
+          const d = (desc: string) => theme.fg("dim", desc)
+          if (mode === "detail") {
+            add(` ${d("type")} ${k(additionalTextLabel)} ${d("•")} ${k("Shift+Enter")} ${d("newline •")} ${k("Enter")} ${d("submit •")} ${k("Tab/Esc")} ${d("back")}`)
+          } else if (allowAdditionalText) {
+            add(` ${k("↑↓ 1-9")} ${d("select •")} ${k("Tab")} ${d("add " + additionalTextLabel + " •")} ${k("0/Esc")} ${d("custom")}`)
+          } else {
+            add(` ${k("↑↓ 1-9")} ${d("select •")} ${k("0/Esc")} ${d("custom")}`)
           }
 
           add(theme.fg("accent", "─".repeat(width)))
@@ -340,6 +426,21 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
         }
       }
 
+      // Freeform: close ask UI, let user type in native editor
+      if (result.freeformRequested) {
+        const freeformChoices = choices.map(c => ({ label: c.label, description: c.description }))
+        const choiceList = freeformChoices
+          .map((c, i) => c.description ? `  ${i + 1}. ${c.label} — ${c.description}` : `  ${i + 1}. ${c.label}`)
+          .join("\n")
+        return {
+          content: [{
+            type: "text",
+            text: `User chose to write a custom response instead of picking from:\n${choiceList}\nDo NOT take action yet — wait for the user's next message.`,
+          }],
+          details: { ...result, freeformChoices },
+        }
+      }
+
       const detailText = result.additionalText ? ` + details: ${result.additionalText}` : ""
       return {
         content: [{ type: "text", text: `User selected ${result.selectedIndex}. ${result.selectedLabel}${detailText}` }],
@@ -362,6 +463,16 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
 
       if (details.cancelled) {
         return new Text(theme.fg("warning", "Cancelled"), 0, 0)
+      }
+
+      if (details.freeformRequested && details.freeformChoices) {
+        const header = theme.fg("muted", "Options were:")
+        const items = details.freeformChoices.map((c, i) => {
+          const line = theme.fg("text", `  ${i + 1}. ${c.label}`)
+          return c.description ? `${line}\n${theme.fg("dim", `     ${c.description}`)}` : line
+        }).join("\n")
+        const footer = theme.fg("dim", "Type your response below.")
+        return new Text(`${header}\n${items}\n${footer}`, 0, 0)
       }
 
       const choice = `${details.selectedIndex}. ${details.selectedLabel}`

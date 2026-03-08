@@ -402,17 +402,6 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  const openFromEditorInput = async (ctx: ExtensionContext) => {
-    const input = ctx.ui.getEditorText()
-    const target = resolveOpenTarget(input, recentMentions)
-    if (!target) {
-      ctx.ui.notify("No open target in input. Use @path, query text, or /open", "warning")
-      return
-    }
-
-    await openTarget(target, ctx, settings)
-  }
-
   const editFromEditorInput = async (ctx: ExtensionContext) => {
     const input = ctx.ui.getEditorText()
     const target = resolveOpenTarget(input, recentMentions)
@@ -423,21 +412,6 @@ export default function (pi: ExtensionAPI) {
 
     await openTarget(target, ctx, settings, settings.editCommand)
   }
-
-  pi.registerShortcut(Key.altShift("s"), {
-    description: "Show/open from current input (@path or free-form query)",
-    handler: openFromEditorInput,
-  })
-
-  pi.registerShortcut(Key.alt("s"), {
-    description: "Show/open from current input (@path or free-form query)",
-    handler: openFromEditorInput,
-  })
-
-  pi.registerShortcut(Key.altShift("e"), {
-    description: "Edit from current input using configured edit command",
-    handler: editFromEditorInput,
-  })
 
   pi.registerShortcut(Key.alt("e"), {
     description: "Edit from current input using configured edit command",

@@ -475,7 +475,7 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
         }
       }
 
-      // Freeform/manual answer: hand control back to the editor and wait for the next typed message.
+      // Freeform/manual answer: keep the tool pending and capture the next typed response.
       if (result.freeformRequested) {
         if (pendingManualAnswer) {
           return {

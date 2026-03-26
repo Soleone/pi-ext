@@ -20,7 +20,17 @@ type AskResult = {
   freeformChoices?: { label: string; description?: string }[]
 }
 
+type PendingManualAnswer = {
+  question: string
+  choices: { label: string; description?: string }[]
+  resolve: (value: {
+    content: { type: "text"; text: string }[]
+    details: AskResult
+  }) => void
+}
+
 const FREEFORM_LABEL = "Write a custom response"
+let pendingManualAnswer: PendingManualAnswer | null = null
 
 const ChoiceObjectSchema = Type.Object({
   label: Type.String({ description: "Visible option label" }),
@@ -118,6 +128,16 @@ function renderDetailBlock(
   return [truncateToWidth(base, width), ...wrapped.map(line => fallbackIndent + line)]
 }
 
+function wrapPrefixedText(text: string, prefix: string, width: number): string[] {
+  const availableWidth = Math.max(1, width - visibleWidth(prefix))
+
+  return text.split(/\r?\n/).flatMap((line) => {
+    const wrapped = wrapTextWithAnsi(line, availableWidth)
+    const segments = wrapped.length > 0 ? wrapped : [""]
+    return segments.map(segment => prefix + segment)
+  })
+}
+
 function makeResult(question: string, overrides: Partial<AskResult> = {}): AskResult {
   return {
     question,
@@ -132,6 +152,35 @@ function makeResult(question: string, overrides: Partial<AskResult> = {}): AskRe
   }
 }
 
+function renderManualAnswerPrompt(theme: any, details: AskResult) {
+  return {
+    invalidate() {},
+    render(width: number): string[] {
+      const lines: string[] = [""]
+      const choices = details.freeformChoices || []
+      const addWrapped = (text: string, prefix = "") => {
+        lines.push(...wrapPrefixedText(text, prefix, width))
+      }
+
+      addWrapped(theme.fg("muted", details.question))
+      lines.push("")
+      addWrapped(theme.fg("dim", "Options:"))
+
+      for (let i = 0; i < choices.length; i++) {
+        const choice = choices[i]
+        addWrapped(theme.fg("text", `${i + 1}. ${choice.label}`))
+        if (choice.description) {
+          addWrapped(theme.fg("dim", choice.description), "   ")
+        }
+      }
+
+      lines.push("")
+      addWrapped(theme.fg("muted", "Type your custom response below and press Enter."))
+      return lines
+    },
+  }
+}
+
 function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
   pi.registerTool({
     name,
@@ -140,7 +189,7 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
       "Ask the user a multiple-choice question in an interactive selector. Tab enables inline typing to add extra free text to the selected option.",
     parameters: AskUserParams,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const choices = normalizeChoices(params.choices)
       const allowAdditionalText = params.allowAdditionalText !== false
       const canCancel = params.canCancel !== false
@@ -351,7 +400,7 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
           const detailIndent = "     "
 
           add(theme.fg("accent", "─".repeat(width)))
-          add(theme.fg("text", ` ${params.question}`))
+          lines.push(...wrapPrefixedText(theme.fg("text", params.question), " ", width))
           lines.push("")
 
           // Render choices
@@ -375,7 +424,7 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
             }
 
             if (choice.description) {
-              add(`${detailIndent}${theme.fg("muted", choice.description)}`)
+              lines.push(...wrapPrefixedText(theme.fg("muted", choice.description), detailIndent, width))
             }
           }
 
@@ -426,19 +475,39 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
         }
       }
 
-      // Freeform: close ask UI, let user type in native editor
+      // Freeform/manual answer: hand control back to the editor and wait for the next typed message.
       if (result.freeformRequested) {
-        const freeformChoices = choices.map(c => ({ label: c.label, description: c.description }))
-        const choiceList = freeformChoices
-          .map((c, i) => c.description ? `  ${i + 1}. ${c.label} — ${c.description}` : `  ${i + 1}. ${c.label}`)
-          .join("\n")
-        return {
-          content: [{
-            type: "text",
-            text: `User chose to write a custom response instead of picking from:\n${choiceList}\nDo NOT take action yet — wait for the user's next message.`,
-          }],
-          details: { ...result, freeformChoices },
+        if (pendingManualAnswer) {
+          return {
+            content: [{
+              type: "text",
+              text: "A manual response is already pending. Wait for the user's next message.",
+            }],
+            details: result,
+          }
         }
+
+        const freeformChoices = choices.map(choice => ({ label: choice.label, description: choice.description }))
+        const pendingDetails = makeResult(params.question, {
+          freeformRequested: true,
+          freeformChoices,
+        })
+
+        onUpdate?.({
+          content: [{ type: "text", text: "Manual response pending" }],
+          details: pendingDetails,
+        })
+
+        ctx.ui.setStatus("pi-ask", "Manual response pending")
+        ctx.ui.setWorkingMessage("Manual response pending — type below and press Enter")
+
+        return await new Promise((resolve) => {
+          pendingManualAnswer = {
+            question: params.question,
+            choices: freeformChoices,
+            resolve,
+          }
+        })
       }
 
       const detailText = result.additionalText ? ` + details: ${result.additionalText}` : ""
@@ -456,6 +525,7 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
 
     renderResult(result, _options, theme) {
       const details = result.details as AskResult | undefined
+
       if (!details) {
         const first = result.content[0]
         return new Text(first?.type === "text" ? first.text : "", 0, 0)
@@ -465,14 +535,12 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
         return new Text(theme.fg("warning", "Cancelled"), 0, 0)
       }
 
-      if (details.freeformRequested && details.freeformChoices) {
-        const header = theme.fg("muted", "Options were:")
-        const items = details.freeformChoices.map((c, i) => {
-          const line = theme.fg("text", `  ${i + 1}. ${c.label}`)
-          return c.description ? `${line}\n${theme.fg("dim", `     ${c.description}`)}` : line
-        }).join("\n")
-        const footer = theme.fg("dim", "Type your response below.")
-        return new Text(`${header}\n${items}\n${footer}`, 0, 0)
+      if (details.selectedIndex == null && details.answer) {
+        return new Text(`${theme.fg("success", "✓ ")}${theme.fg("accent", "Custom response")}\n${theme.fg("text", details.answer)}`, 0, 0)
+      }
+
+      if (details.freeformRequested) {
+        return renderManualAnswerPrompt(theme, details)
       }
 
       const choice = `${details.selectedIndex}. ${details.selectedLabel}`
@@ -487,6 +555,47 @@ function registerAskTool(pi: ExtensionAPI, name: string, label: string) {
 export default function piAsk(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     return { systemPrompt: buildSystemPrompt(event.systemPrompt) }
+  })
+
+  pi.on("session_start", (_event, ctx) => {
+    pendingManualAnswer = null
+    ctx.ui.setStatus("pi-ask", undefined)
+    ctx.ui.setWorkingMessage()
+  })
+
+  pi.on("session_switch", (_event, ctx) => {
+    pendingManualAnswer = null
+    ctx.ui.setStatus("pi-ask", undefined)
+    ctx.ui.setWorkingMessage()
+  })
+
+  pi.on("input", async (event, ctx) => {
+    if (!pendingManualAnswer || event.source === "extension") {
+      return { action: "continue" as const }
+    }
+
+    const answer = event.text.trim()
+    if (!answer) {
+      ctx.ui.notify("Type a response to answer manually", "warning")
+      return { action: "handled" as const }
+    }
+
+    const pending = pendingManualAnswer
+    pendingManualAnswer = null
+    ctx.ui.setStatus("pi-ask", undefined)
+    ctx.ui.setWorkingMessage()
+
+    pending.resolve({
+      content: [{ type: "text", text: `User wrote a custom response: ${answer}` }],
+      details: makeResult(pending.question, {
+        selectedLabel: FREEFORM_LABEL,
+        selectedValue: answer,
+        answer,
+        freeformChoices: pending.choices,
+      }),
+    })
+
+    return { action: "handled" as const }
   })
 
   pi.registerCommand("ask", {
